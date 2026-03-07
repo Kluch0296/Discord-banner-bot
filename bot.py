@@ -22,6 +22,9 @@ bot = commands.Bot(command_prefix=config['command_prefix'], intents=intents)
 # Словарь для хранения информации об арестованных пользователях
 arrested_users: Dict[int, Dict] = {}
 
+# Словарь для хранения активных апелляций
+active_appeals: Dict[int, Dict] = {}
+
 
 class MemberSelectView(View):
     """View для выбора участника для ареста"""
@@ -70,17 +73,12 @@ class TimeSelectView(View):
         self.target_member = target_member
         self.admin = admin
         
-        # Определяем варианты времени (в секундах)
-        time_options = [
-            ("30 секунд", 30),
-            ("60 секунд", 60),
-            ("3 минуты", 180),
-            ("5 минут", 300),
-            ("15 минут", 900),
-            ("1 час", 3600)
-        ]
+        # Получаем варианты времени из конфига
+        arrest_durations = config.get('arrest_durations', [])
         
-        for label, seconds in time_options:
+        for duration_config in arrest_durations:
+            label = duration_config.get('label', 'Неизвестно')
+            seconds = duration_config.get('seconds', 0)
             button = Button(
                 label=label,
                 style=discord.ButtonStyle.danger,
@@ -125,6 +123,205 @@ class TimeSelectView(View):
         return callback
 
 
+class AppealButtonView(View):
+    """View с кнопкой 'Подать апелляцию' для арестованного"""
+    
+    def __init__(self, arrested_member: discord.Member, arrest_duration: int):
+        super().__init__(timeout=None)
+        self.arrested_member = arrested_member
+        self.arrest_duration = arrest_duration
+        
+        # Проверяем, доступна ли апелляция для данного срока
+        voting_durations = config.get('appeal_voting_durations', {})
+        voting_time = voting_durations.get(str(arrest_duration), 0)
+        if voting_time == 0:
+            # Апелляция недоступна для 30 секунд
+            self.clear_items()
+            return
+        
+        appeal_button = Button(
+            label="Подать апелляцию",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"appeal_{arrested_member.id}"
+        )
+        appeal_button.callback = self.appeal_callback
+        self.add_item(appeal_button)
+    
+    async def appeal_callback(self, interaction: discord.Interaction):
+        # Проверяем, что кнопку нажал арестованный
+        if interaction.user.id != self.arrested_member.id:
+            await interaction.response.send_message(
+                "Эта кнопка предназначена только для арестованного пользователя!",
+                ephemeral=True
+            )
+            return
+        
+        # Проверяем, нет ли уже активной апелляции
+        if self.arrested_member.id in active_appeals:
+            await interaction.response.send_message(
+                "Вы уже подали апелляцию!",
+                ephemeral=True
+            )
+            return
+        
+        # Отправляем сообщение с просьбой ввести текст апелляции
+        await interaction.response.edit_message(
+            content=f"{self.arrested_member.mention}, введите текст апелляции:",
+            view=None
+        )
+        
+        # Сохраняем информацию о том, что ожидаем текст апелляции
+        active_appeals[self.arrested_member.id] = {
+            'status': 'awaiting_text',
+            'message': interaction.message,
+            'duration': self.arrest_duration
+        }
+
+
+class AppealVotingView(View):
+    """View с кнопками голосования за/против освобождения"""
+    
+    def __init__(self, arrested_member: discord.Member, voting_duration: int):
+        super().__init__(timeout=voting_duration)
+        self.arrested_member = arrested_member
+        self.votes_release: set = set()  # ID пользователей, проголосовавших за освобождение
+        self.votes_keep: set = set()     # ID пользователей, проголосовавших против
+        
+        release_button = Button(
+            label="Выпустить",
+            style=discord.ButtonStyle.success,
+            custom_id=f"vote_release_{arrested_member.id}"
+        )
+        release_button.callback = self.vote_release_callback
+        self.add_item(release_button)
+        
+        keep_button = Button(
+            label="Не выпускать",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"vote_keep_{arrested_member.id}"
+        )
+        keep_button.callback = self.vote_keep_callback
+        self.add_item(keep_button)
+    
+    async def vote_release_callback(self, interaction: discord.Interaction):
+        user_id = interaction.user.id
+        
+        # Проверяем, не является ли пользователь заключенным
+        jail_role_id = config.get('jail_role_id')
+        if jail_role_id:
+            member = interaction.guild.get_member(user_id)
+            if member and any(role.id == jail_role_id for role in member.roles):
+                await interaction.response.send_message(
+                    "❌ Заключенные не могут участвовать в голосовании!",
+                    ephemeral=True
+                )
+                return
+        
+        # Убираем пользователя из противоположного списка, если он там есть
+        if user_id in self.votes_keep:
+            self.votes_keep.remove(user_id)
+        
+        # Добавляем в список за освобождение
+        if user_id not in self.votes_release:
+            self.votes_release.add(user_id)
+            await interaction.response.send_message(
+                "✅ Ваш голос за освобождение учтен!",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                "Вы уже проголосовали за освобождение!",
+                ephemeral=True
+            )
+    
+    async def vote_keep_callback(self, interaction: discord.Interaction):
+        user_id = interaction.user.id
+        
+        # Проверяем, не является ли пользователь заключенным
+        jail_role_id = config.get('jail_role_id')
+        if jail_role_id:
+            member = interaction.guild.get_member(user_id)
+            if member and any(role.id == jail_role_id for role in member.roles):
+                await interaction.response.send_message(
+                    "❌ Заключенные не могут участвовать в голосовании!",
+                    ephemeral=True
+                )
+                return
+        
+        # Убираем пользователя из противоположного списка, если он там есть
+        if user_id in self.votes_release:
+            self.votes_release.remove(user_id)
+        
+        # Добавляем в список против освобождения
+        if user_id not in self.votes_keep:
+            self.votes_keep.add(user_id)
+            await interaction.response.send_message(
+                "❌ Ваш голос против освобождения учтен!",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                "Вы уже проголосовали против освобождения!",
+                ephemeral=True
+            )
+    
+    async def on_timeout(self):
+        """Вызывается когда истекает время голосования"""
+        # Подсчитываем голоса
+        release_votes = len(self.votes_release)
+        keep_votes = len(self.votes_keep)
+        
+        # Если голосов поровну или за освобождение больше - освобождаем
+        if release_votes >= keep_votes:
+            result = "✅ Апелляция одобрена! Заключенный будет освобожден."
+            should_release = True
+        else:
+            result = "❌ Апелляция отклонена. Заключенный остается под арестом."
+            should_release = False
+        
+        # Обновляем сообщение с результатами
+        if hasattr(self, 'message') and self.message:
+            try:
+                await self.message.edit(
+                    content=f"{self.message.content}\n\n**Голосование завершено!**\n"
+                            f"За освобождение: {release_votes}\n"
+                            f"Против освобождения: {keep_votes}\n\n{result}",
+                    view=None
+                )
+            except:
+                pass
+        
+        # Если решено освободить - освобождаем
+        if should_release and self.arrested_member.id in arrested_users:
+            user_data = arrested_users[self.arrested_member.id]
+            guild = user_data['guild']
+            member = guild.get_member(self.arrested_member.id)
+            
+            if member:
+                try:
+                    # Убираем роль заключенного
+                    await member.remove_roles(user_data['jail_role'], reason="Апелляция одобрена")
+                    
+                    # Возвращаем оригинальные роли
+                    await member.add_roles(*user_data['original_roles'], reason="Апелляция одобрена")
+                    
+                    # Перемещаем обратно в оригинальный канал
+                    if member.voice and user_data['original_channel']:
+                        try:
+                            await member.move_to(user_data['original_channel'], reason="Апелляция одобрена")
+                        except:
+                            pass
+                    
+                    # Удаляем из словаря арестованных
+                    del arrested_users[self.arrested_member.id]
+                except:
+                    pass
+        
+        # Удаляем из активных апелляций
+        if self.arrested_member.id in active_appeals:
+            del active_appeals[self.arrested_member.id]
+
+
 async def arrest_member(
     member: discord.Member,
     duration: int,
@@ -165,6 +362,30 @@ async def arrest_member(
         # Перемещаем в канал тюрьмы
         if member.voice:
             await member.move_to(jail_channel, reason=f"Арестован администратором {admin.display_name}")
+        
+        # Отправляем уведомление об аресте в текстовый канал
+        notification_channel_id = config.get('arrest_notification_channel_id')
+        if notification_channel_id:
+            notification_channel = guild.get_channel(notification_channel_id)
+            if notification_channel:
+                # Создаем View с кнопкой апелляции
+                appeal_view = AppealButtonView(member, duration)
+                
+                # Формируем сообщение
+                voting_durations = config.get('appeal_voting_durations', {})
+                voting_time = voting_durations.get(str(duration), 0)
+                if voting_time == 0:
+                    appeal_info = "\n\n⚠️ Апелляция недоступна для данного срока ареста."
+                else:
+                    appeal_info = f"\n\nВы можете подать апелляцию. Время голосования: {voting_time} секунд."
+                
+                try:
+                    await notification_channel.send(
+                        f"{member.mention}, вас арестовали по решению {admin.mention}.{appeal_info}",
+                        view=appeal_view
+                    )
+                except Exception as e:
+                    print(f"Ошибка при отправке уведомления об аресте: {e}")
         
         # Запускаем таймер освобождения
         asyncio.create_task(release_member_after_timeout(member.id, duration))
@@ -236,6 +457,76 @@ async def on_ready():
     print(f'Бот {bot.user} успешно запущен!')
     print(f'ID бота: {bot.user.id}')
     print('Готов к работе!')
+
+
+@bot.event
+async def on_message(message):
+    """Обработка сообщений для системы апелляций"""
+    
+    # Игнорируем сообщения от ботов
+    if message.author.bot:
+        await bot.process_commands(message)
+        return
+    
+    # Проверяем, ожидается ли текст апелляции от этого пользователя
+    if message.author.id in active_appeals:
+        appeal_data = active_appeals[message.author.id]
+        
+        if appeal_data.get('status') == 'awaiting_text':
+            # Получаем текст апелляции
+            appeal_text = message.content
+            
+            # Удаляем сообщение пользователя
+            try:
+                await message.delete()
+            except:
+                pass
+            
+            # Обновляем статус в уведомлении
+            try:
+                await appeal_data['message'].edit(
+                    content=f"{message.author.mention}, апелляция на рассмотрении...",
+                    view=None
+                )
+            except:
+                pass
+            
+            # Отправляем апелляцию в канал голосования
+            appeal_channel_id = config.get('appeal_voting_channel_id')
+            if appeal_channel_id:
+                appeal_channel = message.guild.get_channel(appeal_channel_id)
+                if appeal_channel:
+                    # Определяем время голосования
+                    voting_durations = config.get('appeal_voting_durations', {})
+                    voting_duration = voting_durations.get(str(appeal_data['duration']), 30)
+                    
+                    # Создаем View с кнопками голосования
+                    voting_view = AppealVotingView(message.author, voting_duration)
+                    
+                    # Отправляем сообщение с апелляцией
+                    try:
+                        voting_message = await appeal_channel.send(
+                            f"**Апелляция от {message.author.mention}**\n\n"
+                            f"**Текст апелляции:**\n{appeal_text}\n\n"
+                            f"**Примите решение** (голосование: {voting_duration} сек):",
+                            view=voting_view
+                        )
+                        
+                        # Сохраняем ссылку на сообщение для обновления после голосования
+                        voting_view.message = voting_message
+                        
+                        # Обновляем статус апелляции
+                        active_appeals[message.author.id]['status'] = 'voting'
+                        
+                    except Exception as e:
+                        print(f"Ошибка при отправке апелляции в канал голосования: {e}")
+                        # Удаляем из активных апелляций при ошибке
+                        del active_appeals[message.author.id]
+            
+            return
+    
+    # Обрабатываем команды
+    await bot.process_commands(message)
 
 
 @bot.command(name='арест')
