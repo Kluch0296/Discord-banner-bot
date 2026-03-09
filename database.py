@@ -66,6 +66,21 @@ class Database:
                 )
             """)
             
+            # Таблица активных арестов
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS active_arrests (
+                    member_id INTEGER PRIMARY KEY,
+                    guild_id INTEGER NOT NULL,
+                    original_channel_id INTEGER,
+                    original_role_ids TEXT NOT NULL,
+                    jail_role_id INTEGER NOT NULL,
+                    arrest_duration INTEGER NOT NULL,
+                    arrest_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    release_timestamp TIMESTAMP NOT NULL,
+                    FOREIGN KEY (guild_id) REFERENCES guild_settings(guild_id) ON DELETE CASCADE
+                )
+            """)
+            
             # Индексы для оптимизации
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_arrest_durations_guild 
@@ -73,14 +88,26 @@ class Database:
             """)
             
             cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_appeal_voting_guild 
+                CREATE INDEX IF NOT EXISTS idx_appeal_voting_guild
                 ON appeal_voting_durations(guild_id)
+            """)
+            
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_active_arrests_guild
+                ON active_arrests(guild_id)
+            """)
+            
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_active_arrests_release
+                ON active_arrests(release_timestamp)
             """)
     
     def get_guild_settings(self, guild_id: int) -> Optional[Dict[str, Any]]:
-        """Получить настройки гильдии"""
+        """Получить настройки гильдии (оптимизированный запрос)"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
+            
+            # Получаем основные настройки
             cursor.execute("""
                 SELECT * FROM guild_settings WHERE guild_id = ?
             """, (guild_id,))
@@ -92,25 +119,32 @@ class Database:
             settings = dict(row)
             settings['admin_role_ids'] = json.loads(settings['admin_role_ids'])
             
-            # Получаем пресеты времени ареста
+            # Получаем пресеты времени ареста и настройки голосования одним запросом
             cursor.execute("""
-                SELECT label, seconds FROM arrest_durations 
-                WHERE guild_id = ? ORDER BY position
+                SELECT
+                    ad.label,
+                    ad.seconds,
+                    avd.voting_seconds
+                FROM arrest_durations ad
+                LEFT JOIN appeal_voting_durations avd
+                    ON ad.guild_id = avd.guild_id AND ad.seconds = avd.arrest_seconds
+                WHERE ad.guild_id = ?
+                ORDER BY ad.position
             """, (guild_id,))
-            settings['arrest_durations'] = [
-                {'label': row['label'], 'seconds': row['seconds']}
-                for row in cursor.fetchall()
-            ]
             
-            # Получаем настройки времени голосования
-            cursor.execute("""
-                SELECT arrest_seconds, voting_seconds FROM appeal_voting_durations
-                WHERE guild_id = ?
-            """, (guild_id,))
-            settings['appeal_voting_durations'] = {
-                str(row['arrest_seconds']): row['voting_seconds']
-                for row in cursor.fetchall()
-            }
+            arrest_durations = []
+            appeal_voting_durations = {}
+            
+            for row in cursor.fetchall():
+                arrest_durations.append({
+                    'label': row['label'],
+                    'seconds': row['seconds']
+                })
+                if row['voting_seconds'] is not None:
+                    appeal_voting_durations[str(row['seconds'])] = row['voting_seconds']
+            
+            settings['arrest_durations'] = arrest_durations
+            settings['appeal_voting_durations'] = appeal_voting_durations
             
             return settings
     
@@ -223,3 +257,73 @@ class Database:
         if settings is None:
             settings = self.create_default_guild_settings(guild_id)
         return settings
+    
+    def save_active_arrest(self, member_id: int, guild_id: int, original_channel_id: Optional[int],
+                          original_role_ids: List[int], jail_role_id: int, arrest_duration: int):
+        """Сохранить информацию об активном аресте"""
+        import datetime
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            release_timestamp = datetime.datetime.utcnow() + datetime.timedelta(seconds=arrest_duration)
+            cursor.execute("""
+                INSERT OR REPLACE INTO active_arrests
+                (member_id, guild_id, original_channel_id, original_role_ids, jail_role_id,
+                 arrest_duration, release_timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (member_id, guild_id, original_channel_id, json.dumps(original_role_ids),
+                  jail_role_id, arrest_duration, release_timestamp))
+    
+    def get_active_arrest(self, member_id: int) -> Optional[Dict[str, Any]]:
+        """Получить информацию об активном аресте"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM active_arrests WHERE member_id = ?
+            """, (member_id,))
+            row = cursor.fetchone()
+            
+            if not row:
+                return None
+            
+            arrest = dict(row)
+            arrest['original_role_ids'] = json.loads(arrest['original_role_ids'])
+            return arrest
+    
+    def remove_active_arrest(self, member_id: int):
+        """Удалить информацию об активном аресте"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM active_arrests WHERE member_id = ?", (member_id,))
+    
+    def get_all_active_arrests(self, guild_id: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Получить все активные аресты (опционально для конкретной гильдии)"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            if guild_id:
+                cursor.execute("SELECT * FROM active_arrests WHERE guild_id = ?", (guild_id,))
+            else:
+                cursor.execute("SELECT * FROM active_arrests")
+            
+            arrests = []
+            for row in cursor.fetchall():
+                arrest = dict(row)
+                arrest['original_role_ids'] = json.loads(arrest['original_role_ids'])
+                arrests.append(arrest)
+            return arrests
+    
+    def get_expired_arrests(self) -> List[Dict[str, Any]]:
+        """Получить все просроченные аресты"""
+        import datetime
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM active_arrests
+                WHERE release_timestamp <= ?
+            """, (datetime.datetime.utcnow(),))
+            
+            arrests = []
+            for row in cursor.fetchall():
+                arrest = dict(row)
+                arrest['original_role_ids'] = json.loads(arrest['original_role_ids'])
+                arrests.append(arrest)
+            return arrests
