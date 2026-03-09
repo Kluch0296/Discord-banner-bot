@@ -678,9 +678,16 @@ async def on_message(message):
 
 # Slash-команда для настройки бота
 @bot.tree.command(name="jail-config", description="Открыть панель настроек бота")
-@app_commands.checks.has_permissions(administrator=True)
 async def jail_config(interaction: discord.Interaction):
     """Открыть панель настроек бота"""
+    
+    # Проверяем права доступа
+    if not has_admin_role(interaction.guild_id, interaction.user):
+        await interaction.response.send_message(
+            "❌ У вас нет прав для использования этой команды!",
+            ephemeral=True
+        )
+        return
     
     # Получаем текущие настройки или создаем по умолчанию
     guild_settings = db.get_or_create_guild_settings(interaction.guild_id)
