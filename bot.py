@@ -1,13 +1,20 @@
 import discord
 from discord.ext import commands
+from discord import app_commands
 from discord.ui import Button, View
 import json
 import asyncio
 from typing import Dict, List, Optional
 
-# Загрузка конфигурации
+from database import Database
+from config_ui import MainConfigPanel, ConfigDraft
+
+# Загрузка конфигурации (только токен и префикс)
 with open('config.json', 'r', encoding='utf-8') as f:
     config = json.load(f)
+
+# Инициализация базы данных
+db = Database()
 
 # Настройка intents
 intents = discord.Intents.default()
@@ -26,13 +33,66 @@ arrested_users: Dict[int, Dict] = {}
 active_appeals: Dict[int, Dict] = {}
 
 
+def get_guild_config(guild_id: int) -> Dict:
+    """Получить конфигурацию гильдии из БД"""
+    return db.get_or_create_guild_settings(guild_id)
+
+
+class WelcomeView(View):
+    """View с кнопкой для открытия панели настроек"""
+    
+    def __init__(self):
+        super().__init__(timeout=None)
+        
+        config_button = Button(
+            label="Открыть панель",
+            style=discord.ButtonStyle.primary,
+            custom_id="open_config_panel"
+        )
+        config_button.callback = self.open_config_callback
+        self.add_item(config_button)
+    
+    async def open_config_callback(self, interaction: discord.Interaction):
+        """Callback для открытия панели настроек"""
+        # Проверяем права администратора
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "❌ Только администраторы могут открывать панель настроек!",
+                ephemeral=True
+            )
+            return
+        
+        # Получаем текущие настройки или создаем по умолчанию
+        guild_settings = db.get_or_create_guild_settings(interaction.guild_id)
+        
+        # Создаем черновик настроек
+        draft = ConfigDraft(interaction.guild_id, guild_settings)
+        
+        # Создаем главную панель
+        panel = MainConfigPanel(bot, draft, interaction.user.id)
+        
+        # Получаем начальный экран
+        content, view = panel.get_current_screen()
+        
+        # Отправляем панель
+        await interaction.response.send_message(
+            content,
+            view=view,
+            ephemeral=True
+        )
+        
+        # Сохраняем ссылку на сообщение
+        panel.message = await interaction.original_response()
+
+
 class MemberSelectView(View):
     """View для выбора участника для ареста"""
     
-    def __init__(self, members: List[discord.Member], admin: discord.Member):
+    def __init__(self, members: List[discord.Member], admin: discord.Member, guild_id: int):
         super().__init__(timeout=60)
         self.selected_member: Optional[discord.Member] = None
         self.admin = admin
+        self.guild_id = guild_id
         
         # Создаем кнопки для каждого участника (максимум 25 кнопок в одном View)
         for i, member in enumerate(members[:25]):
@@ -55,7 +115,7 @@ class MemberSelectView(View):
             
             self.selected_member = member
             # Переходим к выбору времени
-            time_view = TimeSelectView(member, self.admin)
+            time_view = TimeSelectView(member, self.admin, self.guild_id)
             await interaction.response.edit_message(
                 content=f"На какой срок арестовать {member.display_name}?",
                 view=time_view
@@ -68,13 +128,15 @@ class MemberSelectView(View):
 class TimeSelectView(View):
     """View для выбора времени ареста"""
     
-    def __init__(self, target_member: discord.Member, admin: discord.Member):
+    def __init__(self, target_member: discord.Member, admin: discord.Member, guild_id: int):
         super().__init__(timeout=60)
         self.target_member = target_member
         self.admin = admin
+        self.guild_id = guild_id
         
-        # Получаем варианты времени из конфига
-        arrest_durations = config.get('arrest_durations', [])
+        # Получаем варианты времени из БД
+        guild_config = get_guild_config(guild_id)
+        arrest_durations = guild_config.get('arrest_durations', [])
         
         for duration_config in arrest_durations:
             label = duration_config.get('label', 'Неизвестно')
@@ -126,16 +188,18 @@ class TimeSelectView(View):
 class AppealButtonView(View):
     """View с кнопкой 'Подать апелляцию' для арестованного"""
     
-    def __init__(self, arrested_member: discord.Member, arrest_duration: int):
+    def __init__(self, arrested_member: discord.Member, arrest_duration: int, guild_id: int):
         super().__init__(timeout=None)
         self.arrested_member = arrested_member
         self.arrest_duration = arrest_duration
+        self.guild_id = guild_id
         
         # Проверяем, доступна ли апелляция для данного срока
-        voting_durations = config.get('appeal_voting_durations', {})
+        guild_config = get_guild_config(guild_id)
+        voting_durations = guild_config.get('appeal_voting_durations', {})
         voting_time = voting_durations.get(str(arrest_duration), 0)
         if voting_time == 0:
-            # Апелляция недоступна для 30 секунд
+            # Апелляция недоступна
             self.clear_items()
             return
         
@@ -174,16 +238,18 @@ class AppealButtonView(View):
         active_appeals[self.arrested_member.id] = {
             'status': 'awaiting_text',
             'message': interaction.message,
-            'duration': self.arrest_duration
+            'duration': self.arrest_duration,
+            'guild_id': self.guild_id
         }
 
 
 class AppealVotingView(View):
     """View с кнопками голосования за/против освобождения"""
     
-    def __init__(self, arrested_member: discord.Member, voting_duration: int):
+    def __init__(self, arrested_member: discord.Member, voting_duration: int, guild_id: int):
         super().__init__(timeout=voting_duration)
         self.arrested_member = arrested_member
+        self.guild_id = guild_id
         self.votes_release: set = set()  # ID пользователей, проголосовавших за освобождение
         self.votes_keep: set = set()     # ID пользователей, проголосовавших против
         
@@ -207,7 +273,8 @@ class AppealVotingView(View):
         user_id = interaction.user.id
         
         # Проверяем, не является ли пользователь заключенным
-        jail_role_id = config.get('jail_role_id')
+        guild_config = get_guild_config(self.guild_id)
+        jail_role_id = guild_config.get('jail_role_id')
         if jail_role_id:
             member = interaction.guild.get_member(user_id)
             if member and any(role.id == jail_role_id for role in member.roles):
@@ -238,7 +305,8 @@ class AppealVotingView(View):
         user_id = interaction.user.id
         
         # Проверяем, не является ли пользователь заключенным
-        jail_role_id = config.get('jail_role_id')
+        guild_config = get_guild_config(self.guild_id)
+        jail_role_id = guild_config.get('jail_role_id')
         if jail_role_id:
             member = interaction.guild.get_member(user_id)
             if member and any(role.id == jail_role_id for role in member.roles):
@@ -331,12 +399,15 @@ async def arrest_member(
     """Арестовывает участника на указанное время"""
     
     try:
+        # Получаем настройки гильдии
+        guild_config = get_guild_config(guild.id)
+        
         # Получаем канал тюрьмы и роль заключенного
-        jail_channel = guild.get_channel(config['jail_channel_id'])
-        jail_role = guild.get_role(config['jail_role_id'])
+        jail_channel = guild.get_channel(guild_config['jail_channel_id'])
+        jail_role = guild.get_role(guild_config['jail_role_id'])
         
         if not jail_channel or not jail_role:
-            print("Ошибка: канал тюрьмы или роль заключенного не найдены в конфиге")
+            print("Ошибка: канал тюрьмы или роль заключенного не найдены в настройках")
             return False
         
         # Сохраняем текущий голосовой канал
@@ -364,15 +435,15 @@ async def arrest_member(
             await member.move_to(jail_channel, reason=f"Арестован администратором {admin.display_name}")
         
         # Отправляем уведомление об аресте в текстовый канал
-        notification_channel_id = config.get('arrest_notification_channel_id')
+        notification_channel_id = guild_config.get('arrest_notification_channel_id')
         if notification_channel_id:
             notification_channel = guild.get_channel(notification_channel_id)
             if notification_channel:
                 # Создаем View с кнопкой апелляции
-                appeal_view = AppealButtonView(member, duration)
+                appeal_view = AppealButtonView(member, duration, guild.id)
                 
                 # Формируем сообщение
-                voting_durations = config.get('appeal_voting_durations', {})
+                voting_durations = guild_config.get('appeal_voting_durations', {})
                 voting_time = voting_durations.get(str(duration), 0)
                 if voting_time == 0:
                     appeal_info = "\n\n⚠️ Апелляция недоступна для данного срока ареста."
@@ -441,14 +512,44 @@ async def release_member_after_timeout(member_id: int, duration: int):
             del arrested_users[member_id]
 
 
-def has_admin_role(ctx: commands.Context) -> bool:
-    """Проверяет, есть ли у пользователя одна из админских ролей"""
-    if not config['admin_role_ids']:
-        # Если список ролей пуст, проверяем права администратора
-        return ctx.author.guild_permissions.administrator
+def has_admin_role(guild_id: int, member: discord.Member) -> bool:
+    """Проверяет, есть ли у пользователя права администратора или одна из админских ролей"""
+    # Сначала проверяем права администратора сервера
+    if member.guild_permissions.administrator:
+        return True
     
-    user_role_ids = [role.id for role in ctx.author.roles]
-    return any(role_id in user_role_ids for role_id in config['admin_role_ids'])
+    # Затем проверяем дополнительные админские роли (если настроены)
+    guild_config = get_guild_config(guild_id)
+    admin_role_ids = guild_config.get('admin_role_ids', [])
+    
+    if admin_role_ids:
+        user_role_ids = [role.id for role in member.roles]
+        return any(role_id in user_role_ids for role_id in admin_role_ids)
+    
+    return False
+
+
+def validate_bot_configuration(guild_id: int) -> tuple[bool, str]:
+    """Проверяет, что бот настроен для использования команды ареста"""
+    guild_config = get_guild_config(guild_id)
+    
+    # Проверяем обязательные настройки
+    if guild_config.get('jail_channel_id', 0) == 0:
+        return False, "❌ **Бот не настроен!**\nНе указан канал тюрьмы. Используйте </jail-config:1480041904522526823> для настройки."
+    
+    if guild_config.get('jail_role_id', 0) == 0:
+        return False, "❌ **Бот не настроен!**\nНе указана роль заключенного. Используйте </jail-config:1480041904522526823> для настройки."
+    
+    if guild_config.get('arrest_notification_channel_id', 0) == 0:
+        return False, "❌ **Бот не настроен!**\nНе указан канал для подачи апелляций. Используйте </jail-config:1480041904522526823> для настройки."
+    
+    if guild_config.get('appeal_voting_channel_id', 0) == 0:
+        return False, "❌ **Бот не настроен!**\nНе указан канал голосования по апелляциям. Используйте </jail-config:1480041904522526823> для настройки."
+    
+    if not guild_config.get('arrest_durations'):
+        return False, "❌ **Бот не настроен!**\nНе настроены пресеты времени ареста. Используйте </jail-config:1480041904522526823> для настройки."
+    
+    return True, ""
 
 
 @bot.event
@@ -456,7 +557,52 @@ async def on_ready():
     """Событие при запуске бота"""
     print(f'Бот {bot.user} успешно запущен!')
     print(f'ID бота: {bot.user.id}')
+    
+    # Синхронизируем slash-команды
+    try:
+        synced = await bot.tree.sync()
+        print(f'Синхронизировано {len(synced)} slash-команд')
+    except Exception as e:
+        print(f'Ошибка при синхронизации команд: {e}')
+    
     print('Готов к работе!')
+
+
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    """Событие при добавлении бота на сервер"""
+    # Ждем 8 секунд перед отправкой приветственного сообщения
+    await asyncio.sleep(8)
+    
+    # Определяем канал для отправки сообщения
+    target_channel = None
+    
+    # Пытаемся использовать system channel
+    if guild.system_channel and guild.system_channel.permissions_for(guild.me).send_messages:
+        target_channel = guild.system_channel
+    else:
+        # Ищем первый текстовый канал, в который можем писать
+        for channel in guild.text_channels:
+            if channel.permissions_for(guild.me).send_messages:
+                target_channel = channel
+                break
+    
+    # Если нашли подходящий канал, отправляем приветственное сообщение
+    if target_channel:
+        try:
+            welcome_view = WelcomeView()
+            await target_channel.send(
+                "Для первичной настройки используйте </jail-config:1480041904522526823>\n"
+                "или нажмите кнопку \"Открыть панель\""
+                
+                "\n\nРоль бота должна быть выше остальных ролей на сервере (кроме админских, если он не должен сажать и их)",
+                view=welcome_view
+            )
+            print(f'Приветственное сообщение отправлено на сервер {guild.name} (ID: {guild.id})')
+        except Exception as e:
+            print(f'Ошибка при отправке приветственного сообщения на сервер {guild.name}: {e}')
+    else:
+        print(f'Не удалось найти подходящий канал для приветственного сообщения на сервере {guild.name}')
 
 
 @bot.event
@@ -492,16 +638,17 @@ async def on_message(message):
                 pass
             
             # Отправляем апелляцию в канал голосования
-            appeal_channel_id = config.get('appeal_voting_channel_id')
+            guild_config = get_guild_config(appeal_data['guild_id'])
+            appeal_channel_id = guild_config.get('appeal_voting_channel_id')
             if appeal_channel_id:
                 appeal_channel = message.guild.get_channel(appeal_channel_id)
                 if appeal_channel:
                     # Определяем время голосования
-                    voting_durations = config.get('appeal_voting_durations', {})
+                    voting_durations = guild_config.get('appeal_voting_durations', {})
                     voting_duration = voting_durations.get(str(appeal_data['duration']), 30)
                     
                     # Создаем View с кнопками голосования
-                    voting_view = AppealVotingView(message.author, voting_duration)
+                    voting_view = AppealVotingView(message.author, voting_duration, appeal_data['guild_id'])
                     
                     # Отправляем сообщение с апелляцией
                     try:
@@ -529,13 +676,48 @@ async def on_message(message):
     await bot.process_commands(message)
 
 
+# Slash-команда для настройки бота
+@bot.tree.command(name="jail-config", description="Открыть панель настроек бота")
+@app_commands.checks.has_permissions(administrator=True)
+async def jail_config(interaction: discord.Interaction):
+    """Открыть панель настроек бота"""
+    
+    # Получаем текущие настройки или создаем по умолчанию
+    guild_settings = db.get_or_create_guild_settings(interaction.guild_id)
+    
+    # Создаем черновик настроек
+    draft = ConfigDraft(interaction.guild_id, guild_settings)
+    
+    # Создаем главную панель
+    panel = MainConfigPanel(bot, draft, interaction.user.id)
+    
+    # Получаем начальный экран
+    content, view = panel.get_current_screen()
+    
+    # Отправляем панель
+    await interaction.response.send_message(
+        content,
+        view=view,
+        ephemeral=True
+    )
+    
+    # Сохраняем ссылку на сообщение
+    panel.message = await interaction.original_response()
+
+
 @bot.command(name='арест')
 async def arrest_command(ctx: commands.Context):
     """Команда для ареста участника голосового канала"""
     
     # Проверяем права доступа
-    if not has_admin_role(ctx):
+    if not has_admin_role(ctx.guild.id, ctx.author):
         await ctx.send("❌ У вас нет прав для использования этой команды!")
+        return
+    
+    # Проверяем конфигурацию бота
+    is_configured, error_message = validate_bot_configuration(ctx.guild.id)
+    if not is_configured:
+        await ctx.send(error_message)
         return
     
     # Проверяем, находится ли админ в голосовом канале
@@ -557,7 +739,7 @@ async def arrest_command(ctx: commands.Context):
         return
     
     # Создаем View с кнопками участников
-    view = MemberSelectView(members, ctx.author)
+    view = MemberSelectView(members, ctx.author, ctx.guild.id)
     await ctx.send("👮 Кого арестовать?", view=view)
 
 
@@ -573,7 +755,7 @@ async def release_command(ctx: commands.Context, member: discord.Member):
     """Команда для досрочного освобождения участника"""
     
     # Проверяем права доступа
-    if not has_admin_role(ctx):
+    if not has_admin_role(ctx.guild.id, ctx.author):
         await ctx.send("❌ У вас нет прав для использования этой команды!")
         return
     
@@ -612,6 +794,9 @@ async def release_command(ctx: commands.Context, member: discord.Member):
         if member.id in arrested_users:
             del arrested_users[member.id]
 
+
+# Добавляем ссылку на БД в бот для доступа из UI
+bot.db = db
 
 # Запуск бота
 if __name__ == "__main__":

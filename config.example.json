@@ -1,43 +1,4 @@
 {
   "bot_token": "YOUR_BOT_TOKEN_HERE",
-  "jail_channel_id": 0,
-  "jail_role_id": 0,
-  "admin_role_ids": [],
-  "command_prefix": "!",
-  "arrest_notification_channel_id": 0,
-  "appeal_voting_channel_id": 0,
-  "arrest_durations": [
-    {
-      "label": "30 секунд",
-      "seconds": 30
-    },
-    {
-      "label": "60 секунд",
-      "seconds": 60
-    },
-    {
-      "label": "3 минуты",
-      "seconds": 180
-    },
-    {
-      "label": "5 минут",
-      "seconds": 300
-    },
-    {
-      "label": "15 минут",
-      "seconds": 900
-    },
-    {
-      "label": "1 час",
-      "seconds": 3600
-    }
-  ],
-  "appeal_voting_durations": {
-    "30": 0,
-    "60": 15,
-    "180": 20,
-    "300": 30,
-    "900": 50,
-    "3600": 120
-  }
+  "command_prefix": "!"
 }
