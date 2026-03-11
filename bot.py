@@ -51,6 +51,32 @@ bot = commands.Bot(command_prefix=config['command_prefix'], intents=intents)
 active_appeals: Dict[int, Dict] = {}
 
 
+async def send_interaction_message(
+    interaction: discord.Interaction,
+    content: str,
+    *,
+    ephemeral: bool = False,
+    view: Optional[discord.ui.View] = None
+) -> Optional[discord.Message]:
+    """Безопасно отправляет ответ на interaction.
+
+    Если первоначальный ответ уже отправлен, используется followup.
+    Если interaction протух (Unknown interaction), логируем и возвращаем None.
+    """
+    try:
+        if interaction.response.is_done():
+            return await interaction.followup.send(content, ephemeral=ephemeral, view=view)
+
+        await interaction.response.send_message(content, ephemeral=ephemeral, view=view)
+        return await interaction.original_response()
+    except discord.NotFound:
+        logger.warning(
+            "Interaction %s уже недействителен (Unknown interaction): команду обработали слишком поздно",
+            interaction.id
+        )
+        return None
+
+
 def get_guild_config(guild_id: int) -> Dict:
     """Получить конфигурацию гильдии из БД с кэшированием"""
     if guild_id in guild_settings_cache:
@@ -886,36 +912,38 @@ async def on_message(message):
 @bot.tree.command(name="jail-config", description="Открыть панель настроек бота")
 async def jail_config(interaction: discord.Interaction):
     """Открыть панель настроек бота"""
-    
+
+    # Чтобы не получить Unknown interaction при долгой обработке
+    await interaction.response.defer(ephemeral=True)
+
     # Проверяем права доступа
     if not has_admin_role(interaction.guild_id, interaction.user):
-        await interaction.response.send_message(
+        await send_interaction_message(
+            interaction,
             "❌ У вас нет прав для использования этой команды!",
             ephemeral=True
         )
         return
-    
+
     # Получаем текущие настройки или создаем по умолчанию
     guild_settings = db.get_or_create_guild_settings(interaction.guild_id)
-    
+
     # Создаем черновик настроек
     draft = ConfigDraft(interaction.guild_id, guild_settings)
-    
+
     # Создаем главную панель
     panel = MainConfigPanel(bot, draft, interaction.user.id)
-    
+
     # Получаем начальный экран
     content, view = panel.get_current_screen()
-    
+
     # Отправляем панель
-    await interaction.response.send_message(
+    panel.message = await send_interaction_message(
+        interaction,
         content,
         view=view,
         ephemeral=True
     )
-    
-    # Сохраняем ссылку на сообщение
-    panel.message = await interaction.original_response()
 
 
 @bot.command(name='арест')
