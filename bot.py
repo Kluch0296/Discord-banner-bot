@@ -6,7 +6,7 @@ import json
 import asyncio
 import logging
 from typing import Dict, List, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from database import Database
 from config_ui import MainConfigPanel, ConfigDraft
@@ -82,14 +82,14 @@ def get_guild_config(guild_id: int) -> Dict:
     if guild_id in guild_settings_cache:
         cached_data = guild_settings_cache[guild_id]
         # Проверяем, не устарел ли кэш
-        if datetime.utcnow() - cached_data['cached_at'] < timedelta(seconds=CACHE_TTL):
+        if datetime.now(timezone.utc) - cached_data['cached_at'] < timedelta(seconds=CACHE_TTL):
             return cached_data['settings']
     
     # Загружаем из БД
     settings = db.get_or_create_guild_settings(guild_id)
     guild_settings_cache[guild_id] = {
         'settings': settings,
-        'cached_at': datetime.utcnow()
+        'cached_at': datetime.now(timezone.utc)
     }
     return settings
 
@@ -751,7 +751,9 @@ async def restore_active_arrests():
             # Вычисляем оставшееся время
             from datetime import datetime
             release_time = datetime.fromisoformat(arrest_data['release_timestamp'])
-            now = datetime.utcnow()
+            if release_time.tzinfo is None:
+                release_time = release_time.replace(tzinfo=timezone.utc)
+            now = datetime.now(timezone.utc)
             remaining_seconds = (release_time - now).total_seconds()
             
             if remaining_seconds <= 0:
