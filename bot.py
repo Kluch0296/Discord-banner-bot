@@ -130,16 +130,18 @@ class WelcomeView(View):
     
     async def open_config_callback(self, interaction: discord.Interaction):
         """Callback для открытия панели настроек"""
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
         # Проверяем права администратора
         if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "❌ Только администраторы могут открывать панель настроек!",
                 ephemeral=True
             )
             return
         
         # Получаем текущие настройки или создаем по умолчанию
-        guild_settings = db.get_or_create_guild_settings(interaction.guild_id)
+        guild_settings = await asyncio.to_thread(db.get_or_create_guild_settings, interaction.guild_id)
         
         # Создаем черновик настроек
         draft = ConfigDraft(interaction.guild_id, guild_settings)
@@ -151,14 +153,12 @@ class WelcomeView(View):
         content, view = panel.get_current_screen()
         
         # Отправляем панель
-        await interaction.response.send_message(
+        panel.message = await interaction.followup.send(
             content,
             view=view,
-            ephemeral=True
+            ephemeral=True,
+            wait=True
         )
-        
-        # Сохраняем ссылку на сообщение
-        panel.message = await interaction.original_response()
 
 
 class MemberSelectView(View):
@@ -916,7 +916,7 @@ async def jail_config(interaction: discord.Interaction):
     """Открыть панель настроек бота"""
 
     # Чтобы не получить Unknown interaction при долгой обработке
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer(ephemeral=True, thinking=True)
 
     # Проверяем права доступа
     if not has_admin_role(interaction.guild_id, interaction.user):
@@ -928,7 +928,7 @@ async def jail_config(interaction: discord.Interaction):
         return
 
     # Получаем текущие настройки или создаем по умолчанию
-    guild_settings = db.get_or_create_guild_settings(interaction.guild_id)
+    guild_settings = await asyncio.to_thread(db.get_or_create_guild_settings, interaction.guild_id)
 
     # Создаем черновик настроек
     draft = ConfigDraft(interaction.guild_id, guild_settings)
@@ -940,11 +940,11 @@ async def jail_config(interaction: discord.Interaction):
     content, view = panel.get_current_screen()
 
     # Отправляем панель
-    panel.message = await send_interaction_message(
-        interaction,
+    panel.message = await interaction.followup.send(
         content,
         view=view,
-        ephemeral=True
+        ephemeral=True,
+        wait=True
     )
 
 
@@ -1013,6 +1013,7 @@ async def release_command(ctx: commands.Context, member: discord.Member):
 
 # Добавляем ссылку на БД в бот для доступа из UI
 bot.db = db
+bot.invalidate_guild_cache = invalidate_guild_cache
 
 # Запуск бота
 if __name__ == "__main__":
