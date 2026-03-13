@@ -489,7 +489,7 @@ class MainConfigPanel:
         back_btn.callback = self.back_callback
         view.add_item(back_btn)
         
-        await interaction.edit_original_response(
+        await interaction.response.edit_message(
             content="**👮 Выбор дополнительных админских ролей**\n\nВыберите роли, которые смогут использовать команды бота (опционально).\n💡 По умолчанию команды доступны всем администраторам сервера.",
             view=view
         )
@@ -514,7 +514,7 @@ class MainConfigPanel:
             self.navigation.go_back()
             content, view = self.get_current_screen()
             
-            await interaction.edit_original_response(
+            await interaction.response.edit_message(
                 content=f"✅ **{setting_name} обновлен:** {channel.mention}\n\n{content}",
                 view=view
             )
@@ -540,7 +540,7 @@ class MainConfigPanel:
         self.navigation.go_back()
         content, view = self.get_current_screen()
         
-        await interaction.edit_original_response(
+        await interaction.response.edit_message(
             content=f"✅ **Роль заключенного обновлена:** {role_obj.mention}\n\n{content}",
             view=view
         )
@@ -573,7 +573,7 @@ class MainConfigPanel:
         back_btn.callback = self.back_callback
         view.add_item(back_btn)
         
-        await interaction.edit_original_response(
+        await interaction.response.edit_message(
             content="**🔒 Настройка канала тюрьмы**\n\nВыберите существующий голосовой канал или создайте новый:",
             view=view
         )
@@ -606,7 +606,7 @@ class MainConfigPanel:
         back_btn.callback = self.back_callback
         view.add_item(back_btn)
         
-        await interaction.edit_original_response(
+        await interaction.response.edit_message(
             content="**📢 Настройка канала для подачи апелляций**\n\nВыберите существующий текстовый канал или создайте новый:",
             view=view
         )
@@ -639,7 +639,7 @@ class MainConfigPanel:
         back_btn.callback = self.back_callback
         view.add_item(back_btn)
         
-        await interaction.edit_original_response(
+        await interaction.response.edit_message(
             content="**⚖️ Настройка канала голосования**\n\nВыберите существующий текстовый канал или создайте новый:",
             view=view
         )
@@ -671,7 +671,7 @@ class MainConfigPanel:
         back_btn.callback = self.back_callback
         view.add_item(back_btn)
         
-        await interaction.edit_original_response(
+        await interaction.response.edit_message(
             content="**👤 Настройка роли заключенного**\n\nВыберите существующую роль или создайте новую:",
             view=view
         )
@@ -786,7 +786,7 @@ class MainConfigPanel:
         back_btn.callback = self.back_callback
         view.add_item(back_btn)
         
-        await interaction.edit_original_response(
+        await interaction.response.edit_message(
             content="**Выберите пресет для редактирования:**",
             view=view
         )
@@ -858,7 +858,7 @@ class MainConfigPanel:
         back_btn.callback = self.back_callback
         view.add_item(back_btn)
         
-        await interaction.edit_original_response(
+        await interaction.response.edit_message(
             content="**Выберите пресет для удаления:**",
             view=view
         )
@@ -914,7 +914,7 @@ class MainConfigPanel:
         back_btn.callback = self.back_callback
         view.add_item(back_btn)
         
-        await interaction.edit_original_response(
+        await interaction.response.edit_message(
             content="**Выберите пресет для настройки времени голосования:**",
             view=view
         )
