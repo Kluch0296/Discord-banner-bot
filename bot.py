@@ -201,6 +201,64 @@ class MemberSelectView(View):
         return callback
 
 
+class SleepMemberSelectView(View):
+    """View для выбора участника для отключения из голосового канала"""
+    
+    def __init__(self, members: List[discord.Member], admin: discord.Member):
+        super().__init__(timeout=60)
+        self.admin = admin
+        
+        # Создаем кнопки для каждого участника (максимум 25 кнопок в одном View)
+        for i, member in enumerate(members[:25]):
+            button = Button(
+                label=member.display_name,
+                style=discord.ButtonStyle.primary,
+                custom_id=f"sleep_member_{member.id}"
+            )
+            button.callback = self.create_member_callback(member)
+            self.add_item(button)
+    
+    def create_member_callback(self, member: discord.Member):
+        async def callback(interaction: discord.Interaction):
+            if interaction.user.id != self.admin.id:
+                await interaction.response.send_message(
+                    "Только администратор, вызвавший команду, может выбрать участника!",
+                    ephemeral=True
+                )
+                return
+            
+            # Отключаем пользователя из голосового канала
+            if member.voice and member.voice.channel:
+                try:
+                    await member.move_to(None, reason=f"Отключен командой !спать от {self.admin.display_name}")
+                    await interaction.response.edit_message(
+                        content=f"✅ {member.display_name} отключен из голосового канала!",
+                        view=None
+                    )
+                    logger.info(f"{member.display_name} отключен из голосового канала администратором {self.admin.display_name}")
+                except discord.Forbidden:
+                    await interaction.response.edit_message(
+                        content=f"❌ Нет прав для отключения {member.display_name}!",
+                        view=None
+                    )
+                    logger.error(f"Нет прав для отключения {member.display_name}")
+                except Exception as e:
+                    await interaction.response.edit_message(
+                        content=f"❌ Ошибка при отключении {member.display_name}!",
+                        view=None
+                    )
+                    logger.error(f"Ошибка при отключении {member.display_name}: {e}")
+            else:
+                await interaction.response.edit_message(
+                    content=f"❌ {member.display_name} не находится в голосовом канале!",
+                    view=None
+                )
+            
+            self.stop()
+        
+        return callback
+
+
 class TimeSelectView(View):
     """View для выбора времени ареста"""
     
@@ -1009,6 +1067,61 @@ async def release_command(ctx: commands.Context, member: discord.Member):
     
     await release_arrested_member(member, arrest_data, f"Досрочно освобожден {ctx.author.display_name}")
     await ctx.send(f"✅ {member.display_name} досрочно освобожден!")
+
+
+@bot.command(name='спать')
+async def sleep_command(ctx: commands.Context, member: Optional[discord.Member] = None):
+    """Команда для отключения пользователя из голосового канала"""
+    
+    # Проверяем права доступа
+    if not has_admin_role(ctx.guild.id, ctx.author):
+        await ctx.send("❌ У вас нет прав для использования этой команды!")
+        return
+    
+    # Если указан конкретный пользователь
+    if member:
+        # Проверяем, находится ли пользователь в голосовом канале
+        if not member.voice or not member.voice.channel:
+            await ctx.send(f"❌ {member.display_name} не находится в голосовом канале!")
+            return
+        
+        # Отключаем пользователя
+        try:
+            await member.move_to(None, reason=f"Отключен командой !спать от {ctx.author.display_name}")
+            await ctx.send(f"✅ {member.display_name} отключен из голосового канала!")
+            logger.info(f"{member.display_name} отключен из голосового канала администратором {ctx.author.display_name}")
+        except discord.Forbidden:
+            await ctx.send(f"❌ Нет прав для отключения {member.display_name}!")
+            logger.error(f"Нет прав для отключения {member.display_name}")
+        except Exception as e:
+            await ctx.send(f"❌ Ошибка при отключении {member.display_name}!")
+            logger.error(f"Ошибка при отключении {member.display_name}: {e}")
+    else:
+        # Если пользователь не указан, показываем кнопки со всеми пользователями в голосовых каналах
+        # Получаем всех пользователей в голосовых каналах на сервере
+        members_in_voice = []
+        for voice_channel in ctx.guild.voice_channels:
+            for member_in_channel in voice_channel.members:
+                if not member_in_channel.bot:
+                    members_in_voice.append(member_in_channel)
+        
+        if not members_in_voice:
+            await ctx.send("❌ На сервере нет пользователей в голосовых каналах!")
+            return
+        
+        # Создаем View с кнопками пользователей
+        view = SleepMemberSelectView(members_in_voice, ctx.author)
+        await ctx.send("😴 Кого отключить из голосового канала?", view=view)
+
+
+@sleep_command.error
+async def sleep_command_error(ctx: commands.Context, error):
+    """Обработка ошибок команды спать"""
+    if isinstance(error, commands.MemberNotFound):
+        await ctx.send("❌ Пользователь не найден!")
+    else:
+        await ctx.send(f"❌ Произошла ошибка: {str(error)}")
+        logger.error(f"Ошибка в команде спать: {error}", exc_info=error)
 
 
 # Добавляем ссылку на БД в бот для доступа из UI
