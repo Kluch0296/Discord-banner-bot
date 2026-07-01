@@ -64,10 +64,13 @@ async def send_interaction_message(
     Если interaction протух (Unknown interaction), логируем и возвращаем None.
     """
     try:
+        kwargs = {"ephemeral": ephemeral}
+        if view is not None:
+            kwargs["view"] = view
         if interaction.response.is_done():
-            return await interaction.followup.send(content, ephemeral=ephemeral, view=view)
+            return await interaction.followup.send(content, **kwargs)
 
-        await interaction.response.send_message(content, ephemeral=ephemeral, view=view)
+        await interaction.response.send_message(content, **kwargs)
         return await interaction.original_response()
     except discord.NotFound:
         logger.warning(
