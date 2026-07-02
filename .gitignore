@@ -50,4 +50,8 @@ Thumbs.db
 *.bak
 
 # Логи
-*.log
+*.log 
+# SQLite WAL-䠩�� 
+jail_bot.db-wal 
+jail_bot.db-shm 
+jail_bot.db-journal

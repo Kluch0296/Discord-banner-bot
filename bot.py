@@ -4,8 +4,10 @@ from discord import app_commands
 from discord.ui import Button, View
 import json
 import asyncio
+import collections
 import logging
-from typing import Dict, List, Optional
+import re
+from typing import Dict, List, Optional, Set
 from datetime import datetime, timedelta, timezone
 
 from database import Database
@@ -26,16 +28,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger('jail_bot')
 
-# Инициализация базы данных
+# Инициализация базы данных (async, соединение открывается в setup_hook)
 db = Database()
 
-# Кэш настроек гильдий (guild_id -> settings)
+# Безусловные супер-администраторы бота (работают на любом сервере,
+# независимо от настроек гильдии и прав администратора Discord)
+SUPER_ADMIN_IDS: Set[int] = {348169652087685122}
+
+# Кэш настроек гильдий (guild_id -> {'settings': ..., 'cached_at': ...})
 guild_settings_cache: Dict[int, Dict] = {}
 CACHE_TTL = 300  # 5 минут
 
 # Блокировки для предотвращения race conditions
-arrest_locks: Dict[int, asyncio.Lock] = {}  # member_id -> Lock
-appeal_locks: Dict[int, asyncio.Lock] = {}  # member_id -> Lock
+arrest_locks: Dict[int, asyncio.Lock] = collections.defaultdict(asyncio.Lock)
+appeal_locks: Dict[int, asyncio.Lock] = collections.defaultdict(asyncio.Lock)
+
+# Участники с активным голосованием по апелляции (защита от повторной подачи)
+active_appeal_members: Set[int] = set()
 
 # Настройка intents
 intents = discord.Intents.default()
@@ -44,17 +53,66 @@ intents.members = True
 intents.voice_states = True
 intents.guilds = True
 
-# Создание бота
-bot = commands.Bot(command_prefix=config['command_prefix'], intents=intents)
 
-# Словарь для хранения активных апелляций (временно, пока пользователь вводит текст)
-active_appeals: Dict[int, Dict] = {}
+class JailBot(commands.Bot):
+    """Подкласс бота с setup_hook: подключение БД, sync команд, persistent views."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._guild_commands_synced = False
+
+    async def setup_hook(self):
+        # Подключаем БД до старта событий
+        await db.connect()
+
+        # Регистрируем persistent views/items (работают после рестарта)
+        self.add_view(WelcomeView())
+        self.add_dynamic_items(AppealButton)
+
+        # Синхронизируем slash-команды один раз (глобально;
+        # Discord распространяет глобальные команды с задержкой до ~1 часа)
+        try:
+            synced = await self.tree.sync()
+            logger.info(f'Синхронизировано {len(synced)} глобальных slash-команд')
+        except Exception as e:
+            logger.error(f'Ошибка при синхронизации команд: {e}')
+
+    async def sync_guild_commands(self):
+        """Копирует глобальные команды на каждый сервер и синхронизирует их.
+
+        Guild-sync применяется мгновенно (в отличие от глобального),
+        поэтому команды сразу видны в списке при вводе «/».
+        Вызывается один раз после on_ready, когда список гильдий доступен.
+        """
+        if self._guild_commands_synced:
+            return
+        self._guild_commands_synced = True
+
+        for guild in self.guilds:
+            try:
+                self.tree.copy_global_to(guild=guild)
+                synced = await self.tree.sync(guild=guild)
+                logger.info(
+                    f'Синхронизировано {len(synced)} slash-команд на сервере {guild.name} (ID: {guild.id})'
+                )
+            except Exception as e:
+                logger.error(f'Ошибка при синхронизации команд на сервере {guild.name}: {e}')
+
+    async def close(self):
+        try:
+            await db.close()
+        finally:
+            await super().close()
+
+
+bot = JailBot(command_prefix=config['command_prefix'], intents=intents)
 
 
 async def send_interaction_message(
     interaction: discord.Interaction,
-    content: str,
+    content: Optional[str] = None,
     *,
+    embed: Optional[discord.Embed] = None,
     ephemeral: bool = False,
     view: Optional[discord.ui.View] = None
 ) -> Optional[discord.Message]:
@@ -67,6 +125,8 @@ async def send_interaction_message(
         kwargs = {"ephemeral": ephemeral}
         if view is not None:
             kwargs["view"] = view
+        if embed is not None:
+            kwargs["embed"] = embed
         if interaction.response.is_done():
             return await interaction.followup.send(content, **kwargs)
 
@@ -80,16 +140,16 @@ async def send_interaction_message(
         return None
 
 
-def get_guild_config(guild_id: int) -> Dict:
-    """Получить конфигурацию гильдии из БД с кэшированием"""
-    if guild_id in guild_settings_cache:
-        cached_data = guild_settings_cache[guild_id]
-        # Проверяем, не устарел ли кэш
+async def get_guild_config(guild_id: int) -> Dict:
+    """Получить конфигурацию гильдии из БД с кэшированием (TTL)."""
+    cached_data = guild_settings_cache.get(guild_id)
+    if cached_data is not None:
         if datetime.now(timezone.utc) - cached_data['cached_at'] < timedelta(seconds=CACHE_TTL):
             return cached_data['settings']
-    
-    # Загружаем из БД
-    settings = db.get_or_create_guild_settings(guild_id)
+        # Протухшая запись — удаляем
+        del guild_settings_cache[guild_id]
+
+    settings = await db.get_or_create_guild_settings(guild_id)
     guild_settings_cache[guild_id] = {
         'settings': settings,
         'cached_at': datetime.now(timezone.utc)
@@ -98,66 +158,144 @@ def get_guild_config(guild_id: int) -> Dict:
 
 
 def invalidate_guild_cache(guild_id: int):
-    """Инвалидировать кэш настроек гильдии"""
-    if guild_id in guild_settings_cache:
-        del guild_settings_cache[guild_id]
+    """Инвалидировать кэш настроек гильдии."""
+    guild_settings_cache.pop(guild_id, None)
 
 
-def get_arrest_lock(member_id: int) -> asyncio.Lock:
-    """Получить блокировку для ареста пользователя"""
-    if member_id not in arrest_locks:
-        arrest_locks[member_id] = asyncio.Lock()
-    return arrest_locks[member_id]
+def cleanup_lock(locks: Dict[int, asyncio.Lock], member_id: int):
+    """Удалить лок из словаря, если он свободен."""
+    lock = locks.get(member_id)
+    if lock is not None and not lock.locked():
+        locks.pop(member_id, None)
 
 
-def get_appeal_lock(member_id: int) -> asyncio.Lock:
-    """Получить блокировку для апелляции пользователя"""
-    if member_id not in appeal_locks:
-        appeal_locks[member_id] = asyncio.Lock()
-    return appeal_locks[member_id]
+def duration_label(guild_config: Dict, seconds: int) -> str:
+    """Вернуть label пресета по количеству секунд (или человекочитаемый fallback)."""
+    for d in guild_config.get('arrest_durations', []):
+        if d.get('seconds') == seconds:
+            return d.get('label', f"{seconds} сек")
+    return f"{seconds} сек"
 
+
+# ---------------------------------------------------------------------------
+# Embeds
+# ---------------------------------------------------------------------------
+
+def build_arrest_embed(
+    member: discord.Member,
+    admin: discord.abc.User,
+    duration_text: str,
+    release_at: datetime,
+    appeal_info: str
+) -> discord.Embed:
+    """Embed уведомления об аресте (красный)."""
+    unix = int(release_at.timestamp())
+    embed = discord.Embed(
+        title="🚔 Арест",
+        description=appeal_info,
+        color=discord.Color.red()
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name="Кого", value=member.mention, inline=True)
+    embed.add_field(name="Кем", value=admin.mention, inline=True)
+    embed.add_field(name="Срок", value=duration_text, inline=True)
+    embed.add_field(name="Освобождение", value=f"<t:{unix}:R> (<t:{unix}:T>)", inline=False)
+    return embed
+
+
+def build_release_embed(member: discord.Member, reason: str) -> discord.Embed:
+    """Embed сообщения об освобождении (зелёный)."""
+    embed = discord.Embed(
+        title="🔓 Освобождение",
+        description=reason,
+        color=discord.Color.green()
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name="Кого", value=member.mention, inline=True)
+    return embed
+
+
+def build_voting_embed(
+    member: discord.Member,
+    appeal_text: str,
+    deadline: datetime
+) -> discord.Embed:
+    """Embed голосования по апелляции (синий)."""
+    unix = int(deadline.timestamp())
+    embed = discord.Embed(
+        title="⚖️ Апелляция",
+        description=f"**Текст апелляции:**\n{appeal_text}",
+        color=discord.Color.blue()
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name="Кого", value=member.mention, inline=True)
+    embed.add_field(name="Дедлайн голосования", value=f"<t:{unix}:R> (<t:{unix}:T>)", inline=False)
+    return embed
+
+
+def build_voting_result_embed(
+    member: discord.Member,
+    release_votes: int,
+    keep_votes: int,
+    released: bool
+) -> discord.Embed:
+    """Embed результата голосования."""
+    if released:
+        embed = discord.Embed(
+            title="✅ Апелляция одобрена",
+            description="Заключенный будет освобожден.",
+            color=discord.Color.green()
+        )
+    else:
+        embed = discord.Embed(
+            title="❌ Апелляция отклонена",
+            description="Заключенный остается под арестом.",
+            color=discord.Color.red()
+        )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name="Кого", value=member.mention, inline=True)
+    embed.add_field(name="✅ За освобождение", value=str(release_votes), inline=True)
+    embed.add_field(name="❌ Против", value=str(keep_votes), inline=True)
+    return embed
+
+
+# ---------------------------------------------------------------------------
+# Views
+# ---------------------------------------------------------------------------
 
 class WelcomeView(View):
-    """View с кнопкой для открытия панели настроек"""
-    
-    def __init__(self):
-        super().__init__(timeout=3600)  # 1 час timeout
-        
-        config_button = Button(
-            label="Открыть панель",
-            style=discord.ButtonStyle.primary,
-            custom_id="open_config_panel"
-        )
-        config_button.callback = self.open_config_callback
-        self.add_item(config_button)
-    
-    async def open_config_callback(self, interaction: discord.Interaction):
-        """Callback для открытия панели настроек"""
-        await interaction.response.defer(ephemeral=True, thinking=True)
+    """Persistent view с кнопкой для открытия панели настроек."""
 
-        # Проверяем права администратора
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.followup.send(
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Открыть панель",
+        style=discord.ButtonStyle.primary,
+        custom_id="open_config_panel"
+    )
+    async def open_config(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Callback для открытия панели настроек."""
+        # Проверка прав ДО defer
+        if (interaction.user.id not in SUPER_ADMIN_IDS
+                and not interaction.user.guild_permissions.administrator):
+            await interaction.response.send_message(
                 "❌ Только администраторы могут открывать панель настроек!",
                 ephemeral=True
             )
             return
-        
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
         # Получаем текущие настройки или создаем по умолчанию
-        guild_settings = await asyncio.to_thread(db.get_or_create_guild_settings, interaction.guild_id)
-        
-        # Создаем черновик настроек
+        guild_settings = await db.get_or_create_guild_settings(interaction.guild_id)
+
         draft = ConfigDraft(interaction.guild_id, guild_settings)
-        
-        # Создаем главную панель
         panel = MainConfigPanel(bot, draft, interaction.user.id)
-        
-        # Получаем начальный экран
-        content, view = panel.get_current_screen()
-        
-        # Отправляем панель
+        embed, view = panel.get_current_screen()
+
         panel.message = await interaction.followup.send(
-            content,
+            embed=embed,
             view=view,
             ephemeral=True,
             wait=True
@@ -165,117 +303,124 @@ class WelcomeView(View):
 
 
 class MemberSelectView(View):
-    """View для выбора участника для ареста"""
-    
-    def __init__(self, members: List[discord.Member], admin: discord.Member, guild_id: int):
+    """View с Select для выбора участника для ареста."""
+
+    def __init__(self, members: List[discord.Member], admin: discord.Member,
+                 guild_id: int, guild_config: Dict):
         super().__init__(timeout=60)
-        self.selected_member: Optional[discord.Member] = None
         self.admin = admin
         self.guild_id = guild_id
-        
-        # Создаем кнопки для каждого участника (максимум 25 кнопок в одном View)
-        for i, member in enumerate(members[:25]):
-            button = Button(
-                label=member.display_name,
-                style=discord.ButtonStyle.primary,
-                custom_id=f"member_{member.id}"
+        self.guild_config = guild_config
+        self.members_by_id = {m.id: m for m in members[:25]}
+
+        select = discord.ui.Select(
+            placeholder="🔍 Выберите участника для ареста...",
+            options=[
+                discord.SelectOption(label=m.display_name, value=str(m.id))
+                for m in members[:25]
+            ]
+        )
+        select.callback = self.select_callback
+        self.select = select
+        self.add_item(select)
+
+    async def select_callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.admin.id:
+            await interaction.response.send_message(
+                "Только администратор, вызвавший команду, может выбрать участника!",
+                ephemeral=True
             )
-            button.callback = self.create_member_callback(member)
-            self.add_item(button)
-    
-    def create_member_callback(self, member: discord.Member):
-        async def callback(interaction: discord.Interaction):
-            if interaction.user.id != self.admin.id:
-                await interaction.response.send_message(
-                    "Только администратор, вызвавший команду, может выбрать участника!",
-                    ephemeral=True
-                )
-                return
-            
-            self.selected_member = member
-            # Переходим к выбору времени
-            time_view = TimeSelectView(member, self.admin, self.guild_id)
-            await interaction.response.edit_message(
-                content=f"На какой срок арестовать {member.display_name}?",
-                view=time_view
-            )
-            self.stop()
-        
-        return callback
+            return
+
+        member = self.members_by_id.get(int(self.select.values[0]))
+        if member is None:
+            await interaction.response.send_message("❌ Участник не найден!", ephemeral=True)
+            return
+
+        # Переходим к выбору времени (настройки уже загружены)
+        time_view = TimeSelectView(member, self.admin, self.guild_id, self.guild_config)
+        await interaction.response.edit_message(
+            content=f"На какой срок арестовать {member.display_name}?",
+            view=time_view
+        )
+        self.stop()
 
 
 class SleepMemberSelectView(View):
-    """View для выбора участника для отключения из голосового канала"""
-    
+    """View с Select для выбора участника для отключения из голосового канала."""
+
     def __init__(self, members: List[discord.Member], admin: discord.Member):
         super().__init__(timeout=60)
         self.admin = admin
-        
-        # Создаем кнопки для каждого участника (максимум 25 кнопок в одном View)
-        for i, member in enumerate(members[:25]):
-            button = Button(
-                label=member.display_name,
-                style=discord.ButtonStyle.primary,
-                custom_id=f"sleep_member_{member.id}"
+        self.members_by_id = {m.id: m for m in members[:25]}
+
+        select = discord.ui.Select(
+            placeholder="🔍 Выберите участника для отключения...",
+            options=[
+                discord.SelectOption(label=m.display_name, value=str(m.id))
+                for m in members[:25]
+            ]
+        )
+        select.callback = self.select_callback
+        self.select = select
+        self.add_item(select)
+
+    async def select_callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.admin.id:
+            await interaction.response.send_message(
+                "Только администратор, вызвавший команду, может выбрать участника!",
+                ephemeral=True
             )
-            button.callback = self.create_member_callback(member)
-            self.add_item(button)
-    
-    def create_member_callback(self, member: discord.Member):
-        async def callback(interaction: discord.Interaction):
-            if interaction.user.id != self.admin.id:
-                await interaction.response.send_message(
-                    "Только администратор, вызвавший команду, может выбрать участника!",
-                    ephemeral=True
-                )
-                return
-            
-            # Отключаем пользователя из голосового канала
-            if member.voice and member.voice.channel:
-                try:
-                    await member.move_to(None, reason=f"Отключен командой !спать от {self.admin.display_name}")
-                    await interaction.response.edit_message(
-                        content=f"✅ {member.display_name} отключен из голосового канала!",
-                        view=None
-                    )
-                    logger.info(f"{member.display_name} отключен из голосового канала администратором {self.admin.display_name}")
-                except discord.Forbidden:
-                    await interaction.response.edit_message(
-                        content=f"❌ Нет прав для отключения {member.display_name}!",
-                        view=None
-                    )
-                    logger.error(f"Нет прав для отключения {member.display_name}")
-                except Exception as e:
-                    await interaction.response.edit_message(
-                        content=f"❌ Ошибка при отключении {member.display_name}!",
-                        view=None
-                    )
-                    logger.error(f"Ошибка при отключении {member.display_name}: {e}")
-            else:
+            return
+
+        member = self.members_by_id.get(int(self.select.values[0]))
+        if member is None:
+            await interaction.response.send_message("❌ Участник не найден!", ephemeral=True)
+            return
+
+        # Отключаем пользователя из голосового канала
+        if member.voice and member.voice.channel:
+            try:
+                await member.move_to(None, reason=f"Отключен командой !спать от {self.admin.display_name}")
                 await interaction.response.edit_message(
-                    content=f"❌ {member.display_name} не находится в голосовом канале!",
+                    content=f"✅ {member.display_name} отключен из голосового канала!",
                     view=None
                 )
-            
-            self.stop()
-        
-        return callback
+                logger.info(f"{member.display_name} отключен из голосового канала администратором {self.admin.display_name}")
+            except discord.Forbidden:
+                await interaction.response.edit_message(
+                    content=f"❌ Нет прав для отключения {member.display_name}!",
+                    view=None
+                )
+                logger.error(f"Нет прав для отключения {member.display_name}")
+            except Exception as e:
+                await interaction.response.edit_message(
+                    content=f"❌ Ошибка при отключении {member.display_name}!",
+                    view=None
+                )
+                logger.error(f"Ошибка при отключении {member.display_name}: {e}")
+        else:
+            await interaction.response.edit_message(
+                content=f"❌ {member.display_name} не находится в голосовом канале!",
+                view=None
+            )
+
+        self.stop()
 
 
 class TimeSelectView(View):
-    """View для выбора времени ареста"""
-    
-    def __init__(self, target_member: discord.Member, admin: discord.Member, guild_id: int):
+    """View для выбора времени ареста (настройки передаются уже загруженными)."""
+
+    def __init__(self, target_member: discord.Member, admin: discord.Member,
+                 guild_id: int, guild_config: Dict):
         super().__init__(timeout=60)
         self.target_member = target_member
         self.admin = admin
         self.guild_id = guild_id
-        
-        # Получаем варианты времени из БД
-        guild_config = get_guild_config(guild_id)
+
         arrest_durations = guild_config.get('arrest_durations', [])
-        
-        for duration_config in arrest_durations:
+
+        for duration_config in arrest_durations[:25]:
             label = duration_config.get('label', 'Неизвестно')
             seconds = duration_config.get('seconds', 0)
             button = Button(
@@ -283,10 +428,10 @@ class TimeSelectView(View):
                 style=discord.ButtonStyle.danger,
                 custom_id=f"time_{seconds}"
             )
-            button.callback = self.create_time_callback(seconds)
+            button.callback = self.create_time_callback(seconds, label)
             self.add_item(button)
-    
-    def create_time_callback(self, duration: int):
+
+    def create_time_callback(self, duration: int, label: str):
         async def callback(interaction: discord.Interaction):
             if interaction.user.id != self.admin.id:
                 await interaction.response.send_message(
@@ -294,12 +439,12 @@ class TimeSelectView(View):
                     ephemeral=True
                 )
                 return
-            
+
             await interaction.response.edit_message(
-                content=f"Арестовываю {self.target_member.display_name} на {duration} секунд...",
+                content=f"Арестовываю {self.target_member.display_name} на {label}...",
                 view=None
             )
-            
+
             # Выполняем арест
             success = await arrest_member(
                 self.target_member,
@@ -307,267 +452,352 @@ class TimeSelectView(View):
                 interaction.guild,
                 interaction.user
             )
-            
+
             if success:
                 await interaction.edit_original_response(
-                    content=f"✅ {self.target_member.display_name} арестован на {duration} секунд!"
+                    content=f"✅ {self.target_member.display_name} арестован на {label}!"
                 )
             else:
                 await interaction.edit_original_response(
                     content=f"❌ Не удалось арестовать {self.target_member.display_name}. Проверьте права бота."
                 )
-            
+
             self.stop()
-        
+
         return callback
 
 
-class AppealButtonView(View):
-    """View с кнопкой 'Подать апелляцию' для арестованного"""
-    
-    def __init__(self, arrested_member: discord.Member, arrest_duration: int, guild_id: int):
-        super().__init__(timeout=None)
-        self.arrested_member = arrested_member
+class AppealModal(discord.ui.Modal, title="Подача апелляции"):
+    """Модальное окно для ввода текста апелляции."""
+
+    appeal_text = discord.ui.TextInput(
+        label="Текст апелляции",
+        style=discord.TextStyle.paragraph,
+        placeholder="Опишите, почему вас следует освободить...",
+        required=True,
+        max_length=1000
+    )
+
+    def __init__(self, member: discord.Member, arrest_duration: int, guild_id: int):
+        super().__init__()
+        self.member = member
         self.arrest_duration = arrest_duration
         self.guild_id = guild_id
-        
-        # Проверяем, доступна ли апелляция для данного срока
-        guild_config = get_guild_config(guild_id)
-        voting_durations = guild_config.get('appeal_voting_durations', {})
-        voting_time = voting_durations.get(str(arrest_duration), 0)
-        if voting_time == 0:
-            # Апелляция недоступна
-            self.clear_items()
+
+    async def on_submit(self, interaction: discord.Interaction):
+        lock = appeal_locks[self.member.id]
+        if lock.locked():
+            await interaction.response.send_message("Апелляция уже обрабатывается!", ephemeral=True)
             return
-        
-        appeal_button = Button(
-            label="Подать апелляцию",
-            style=discord.ButtonStyle.primary,
-            custom_id=f"appeal_{arrested_member.id}"
+
+        async with lock:
+            try:
+                # Защита от повторной подачи
+                if self.member.id in active_appeal_members:
+                    await interaction.response.send_message(
+                        "Вы уже подали апелляцию!", ephemeral=True
+                    )
+                    return
+
+                # Арест еще активен?
+                arrest_data = await db.get_active_arrest(self.member.id)
+                if not arrest_data:
+                    await interaction.response.send_message(
+                        "Ваш арест уже завершен.", ephemeral=True
+                    )
+                    return
+
+                guild_config = await get_guild_config(self.guild_id)
+                appeal_channel_id = guild_config.get('appeal_voting_channel_id')
+                if not appeal_channel_id:
+                    await interaction.response.send_message(
+                        "❌ Канал голосования не настроен!", ephemeral=True
+                    )
+                    return
+
+                appeal_channel = interaction.guild.get_channel(appeal_channel_id)
+                if not appeal_channel:
+                    await interaction.response.send_message(
+                        "❌ Канал голосования не найден!", ephemeral=True
+                    )
+                    return
+
+                # Определяем время голосования
+                voting_durations = guild_config.get('appeal_voting_durations', {})
+                voting_duration = voting_durations.get(str(self.arrest_duration), 30)
+                if voting_duration <= 0:
+                    await interaction.response.send_message(
+                        "⚠️ Апелляция недоступна для данного срока ареста.", ephemeral=True
+                    )
+                    return
+
+                deadline = datetime.now(timezone.utc) + timedelta(seconds=voting_duration)
+
+                # Создаем View с кнопками голосования и отправляем embed
+                voting_view = AppealVotingView(self.member, voting_duration, self.guild_id)
+                voting_embed = build_voting_embed(self.member, self.appeal_text.value, deadline)
+
+                voting_message = await appeal_channel.send(embed=voting_embed, view=voting_view)
+                voting_view.message = voting_message
+
+                active_appeal_members.add(self.member.id)
+
+                await interaction.response.send_message(
+                    "✅ Апелляция подана! Голосование началось.", ephemeral=True
+                )
+                logger.info(f"Апелляция от {self.member.display_name} отправлена на голосование")
+            except Exception as e:
+                logger.error(f"Ошибка при подаче апелляции: {e}")
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(
+                        "❌ Ошибка при подаче апелляции!", ephemeral=True
+                    )
+        cleanup_lock(appeal_locks, self.member.id)
+
+
+class AppealButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=r"appeal_(?P<member_id>[0-9]+)"
+):
+    """Persistent-кнопка «Подать апелляцию»: работает и после рестарта бота.
+
+    Данные ареста берутся из БД по member_id из custom_id.
+    """
+
+    def __init__(self, member_id: int):
+        self.member_id = member_id
+        super().__init__(
+            discord.ui.Button(
+                label="Подать апелляцию",
+                style=discord.ButtonStyle.primary,
+                custom_id=f"appeal_{member_id}"
+            )
         )
-        appeal_button.callback = self.appeal_callback
-        self.add_item(appeal_button)
-    
-    async def appeal_callback(self, interaction: discord.Interaction):
-        # Проверяем, что кнопку нажал арестованный
-        if interaction.user.id != self.arrested_member.id:
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match: re.Match):
+        return cls(int(match['member_id']))
+
+    async def callback(self, interaction: discord.Interaction):
+        # Кнопка только для арестованного
+        if interaction.user.id != self.member_id:
             await interaction.response.send_message(
                 "Эта кнопка предназначена только для арестованного пользователя!",
                 ephemeral=True
             )
             return
-        
-        # Используем блокировку для предотвращения race condition
-        lock = get_appeal_lock(self.arrested_member.id)
-        if lock.locked():
+
+        # Защита от повторной подачи
+        if self.member_id in active_appeal_members:
             await interaction.response.send_message(
-                "Апелляция уже обрабатывается!",
-                ephemeral=True
+                "Вы уже подали апелляцию!", ephemeral=True
             )
             return
-        
-        async with lock:
-            # Проверяем, нет ли уже активной апелляции
-            if self.arrested_member.id in active_appeals:
-                await interaction.response.send_message(
-                    "Вы уже подали апелляцию!",
-                    ephemeral=True
-                )
-                return
-            
-            # Отправляем сообщение с просьбой ввести текст апелляции
-            await interaction.response.edit_message(
-                content=f"{self.arrested_member.mention}, введите текст апелляции:",
-                view=None
+
+        # Проверяем, что арест еще активен (данные из БД)
+        arrest_data = await db.get_active_arrest(self.member_id)
+        if not arrest_data:
+            await interaction.response.send_message(
+                "Ваш арест уже завершен.", ephemeral=True
             )
-            
-            # Сохраняем информацию о том, что ожидаем текст апелляции
-            active_appeals[self.arrested_member.id] = {
-                'status': 'awaiting_text',
-                'message': interaction.message,
-                'duration': self.arrest_duration,
-                'guild_id': self.guild_id
-            }
+            return
+
+        guild_config = await get_guild_config(arrest_data['guild_id'])
+        voting_durations = guild_config.get('appeal_voting_durations', {})
+        voting_time = voting_durations.get(str(arrest_data['arrest_duration']), 0)
+        if voting_time <= 0:
+            await interaction.response.send_message(
+                "⚠️ Апелляция недоступна для данного срока ареста.", ephemeral=True
+            )
+            return
+
+        member = interaction.guild.get_member(self.member_id) or interaction.user
+        modal = AppealModal(member, arrest_data['arrest_duration'], arrest_data['guild_id'])
+        await interaction.response.send_modal(modal)
 
 
 class AppealVotingView(View):
-    """View с кнопками голосования за/против освобождения"""
-    
+    """View с кнопками голосования за/против освобождения (живой счётчик)."""
+
     def __init__(self, arrested_member: discord.Member, voting_duration: int, guild_id: int):
         super().__init__(timeout=voting_duration)
         self.arrested_member = arrested_member
         self.guild_id = guild_id
-        self.votes_release: set = set()  # ID пользователей, проголосовавших за освобождение
-        self.votes_keep: set = set()     # ID пользователей, проголосовавших против
-        
-        release_button = Button(
-            label="Выпустить",
+        self.message: Optional[discord.Message] = None
+        self.votes_release: set = set()
+        self.votes_keep: set = set()
+
+        self.release_button = Button(
+            label="✅ Выпустить (0)",
             style=discord.ButtonStyle.success,
             custom_id=f"vote_release_{arrested_member.id}"
         )
-        release_button.callback = self.vote_release_callback
-        self.add_item(release_button)
-        
-        keep_button = Button(
-            label="Не выпускать",
+        self.release_button.callback = self.vote_release_callback
+        self.add_item(self.release_button)
+
+        self.keep_button = Button(
+            label="❌ Не выпускать (0)",
             style=discord.ButtonStyle.danger,
             custom_id=f"vote_keep_{arrested_member.id}"
         )
-        keep_button.callback = self.vote_keep_callback
-        self.add_item(keep_button)
-    
+        self.keep_button.callback = self.vote_keep_callback
+        self.add_item(self.keep_button)
+
+    async def _is_jailed(self, interaction: discord.Interaction) -> bool:
+        """Проверяет, является ли голосующий заключенным."""
+        guild_config = await get_guild_config(self.guild_id)
+        jail_role_id = guild_config.get('jail_role_id')
+        if jail_role_id:
+            member = interaction.guild.get_member(interaction.user.id)
+            if member and any(role.id == jail_role_id for role in member.roles):
+                return True
+        return False
+
+    def _update_labels(self):
+        self.release_button.label = f"✅ Выпустить ({len(self.votes_release)})"
+        self.keep_button.label = f"❌ Не выпускать ({len(self.votes_keep)})"
+
+    async def _refresh_message(self, interaction: discord.Interaction):
+        """Обновить сообщение голосования с новыми счётчиками."""
+        self._update_labels()
+        try:
+            await interaction.message.edit(view=self)
+        except discord.HTTPException as e:
+            logger.warning(f"Не удалось обновить счётчик голосов: {e}")
+
     async def vote_release_callback(self, interaction: discord.Interaction):
         user_id = interaction.user.id
-        
-        # Проверяем, не является ли пользователь заключенным
-        guild_config = get_guild_config(self.guild_id)
-        jail_role_id = guild_config.get('jail_role_id')
-        if jail_role_id:
-            member = interaction.guild.get_member(user_id)
-            if member and any(role.id == jail_role_id for role in member.roles):
-                await interaction.response.send_message(
-                    "❌ Заключенные не могут участвовать в голосовании!",
-                    ephemeral=True
-                )
-                return
-        
-        # Убираем пользователя из противоположного списка, если он там есть
-        if user_id in self.votes_keep:
-            self.votes_keep.remove(user_id)
-        
-        # Добавляем в список за освобождение
-        if user_id not in self.votes_release:
-            self.votes_release.add(user_id)
+
+        if await self._is_jailed(interaction):
             await interaction.response.send_message(
-                "✅ Ваш голос за освобождение учтен!",
-                ephemeral=True
+                "❌ Заключенные не могут участвовать в голосовании!", ephemeral=True
             )
-        else:
+            return
+
+        if user_id in self.votes_release:
             await interaction.response.send_message(
-                "Вы уже проголосовали за освобождение!",
-                ephemeral=True
+                "Вы уже проголосовали за освобождение!", ephemeral=True
             )
-    
+            return
+
+        self.votes_keep.discard(user_id)
+        self.votes_release.add(user_id)
+        await interaction.response.send_message(
+            "✅ Ваш голос за освобождение учтен!", ephemeral=True
+        )
+        await self._refresh_message(interaction)
+
     async def vote_keep_callback(self, interaction: discord.Interaction):
         user_id = interaction.user.id
-        
-        # Проверяем, не является ли пользователь заключенным
-        guild_config = get_guild_config(self.guild_id)
-        jail_role_id = guild_config.get('jail_role_id')
-        if jail_role_id:
-            member = interaction.guild.get_member(user_id)
-            if member and any(role.id == jail_role_id for role in member.roles):
-                await interaction.response.send_message(
-                    "❌ Заключенные не могут участвовать в голосовании!",
-                    ephemeral=True
-                )
-                return
-        
-        # Убираем пользователя из противоположного списка, если он там есть
-        if user_id in self.votes_release:
-            self.votes_release.remove(user_id)
-        
-        # Добавляем в список против освобождения
-        if user_id not in self.votes_keep:
-            self.votes_keep.add(user_id)
+
+        if await self._is_jailed(interaction):
             await interaction.response.send_message(
-                "❌ Ваш голос против освобождения учтен!",
-                ephemeral=True
+                "❌ Заключенные не могут участвовать в голосовании!", ephemeral=True
             )
-        else:
+            return
+
+        if user_id in self.votes_keep:
             await interaction.response.send_message(
-                "Вы уже проголосовали против освобождения!",
-                ephemeral=True
+                "Вы уже проголосовали против освобождения!", ephemeral=True
             )
-    
+            return
+
+        self.votes_release.discard(user_id)
+        self.votes_keep.add(user_id)
+        await interaction.response.send_message(
+            "❌ Ваш голос против освобождения учтен!", ephemeral=True
+        )
+        await self._refresh_message(interaction)
+
     async def on_timeout(self):
-        """Вызывается когда истекает время голосования"""
-        # Подсчитываем голоса
+        """Вызывается когда истекает время голосования."""
         release_votes = len(self.votes_release)
         keep_votes = len(self.votes_keep)
-        
-        # Если голосов поровну или за освобождение больше - освобождаем
-        if release_votes >= keep_votes:
-            result = "✅ Апелляция одобрена! Заключенный будет освобожден."
-            should_release = True
-        else:
-            result = "❌ Апелляция отклонена. Заключенный остается под арестом."
-            should_release = False
-        
-        # Обновляем сообщение с результатами
-        if hasattr(self, 'message') and self.message:
+
+        should_release = release_votes >= keep_votes
+
+        # Обновляем сообщение с результатами (embed)
+        if self.message:
             try:
-                await self.message.edit(
-                    content=f"{self.message.content}\n\n**Голосование завершено!**\n"
-                            f"За освобождение: {release_votes}\n"
-                            f"Против освобождения: {keep_votes}\n\n{result}",
-                    view=None
+                result_embed = build_voting_result_embed(
+                    self.arrested_member, release_votes, keep_votes, should_release
                 )
+                await self.message.edit(embed=result_embed, view=None)
             except Exception as e:
                 logger.error(f"Ошибка при обновлении сообщения голосования: {e}")
-        
-        # Если решено освободить - освобождаем
-        if should_release:
-            arrest_data = db.get_active_arrest(self.arrested_member.id)
-            if arrest_data:
-                guild = bot.get_guild(arrest_data['guild_id'])
-                if guild:
-                    member = guild.get_member(self.arrested_member.id)
-                    if member:
-                        await release_arrested_member(member, arrest_data, "Апелляция одобрена")
-        
-        # Удаляем из активных апелляций
-        if self.arrested_member.id in active_appeals:
-            del active_appeals[self.arrested_member.id]
 
+        # Если решено освободить — освобождаем (под локом ареста)
+        if should_release:
+            try:
+                arrest_data = await db.get_active_arrest(self.arrested_member.id)
+                if arrest_data:
+                    guild = bot.get_guild(arrest_data['guild_id'])
+                    if guild:
+                        member = guild.get_member(self.arrested_member.id)
+                        if member:
+                            async with arrest_locks[member.id]:
+                                arrest_data = await db.get_active_arrest(member.id)
+                                if arrest_data:
+                                    await release_arrested_member(member, arrest_data, "Апелляция одобрена")
+                            cleanup_lock(arrest_locks, member.id)
+            except Exception as e:
+                logger.error(f"Ошибка при освобождении после апелляции: {e}")
+
+        # Снимаем защиту от повторной подачи
+        active_appeal_members.discard(self.arrested_member.id)
+
+
+# ---------------------------------------------------------------------------
+# Логика ареста / освобождения
+# ---------------------------------------------------------------------------
 
 async def release_arrested_member(member: discord.Member, arrest_data: Dict, reason: str):
-    """Освобождает арестованного участника"""
+    """Освобождает арестованного участника (роли — одним вызовом member.edit)."""
     try:
         guild = member.guild
         jail_role = guild.get_role(arrest_data['jail_role_id'])
-        
+
         if not jail_role:
             logger.error(f"Роль заключенного {arrest_data['jail_role_id']} не найдена")
-            db.remove_active_arrest(member.id)
+            await db.remove_active_arrest(member.id)
             return
-        
+
         # Проверяем права бота на управление ролями
         if not guild.me.guild_permissions.manage_roles:
             logger.error(f"У бота нет прав manage_roles на сервере {guild.name}")
             return
-        
+
         # Проверяем, что роль бота выше роли заключенного
         if jail_role >= guild.me.top_role:
             logger.error(f"Роль бота ниже роли заключенного на сервере {guild.name}")
             return
-        
-        # Убираем роль заключенного
+
+        # Формируем новый список ролей одним вызовом:
+        # - оригинальные роли (только те, что ниже top_role бота и не managed)
+        # - текущие роли, которые бот не может трогать (managed или выше top_role) — сохраняем как есть
+        new_roles = []
+        for role in member.roles:
+            if role.is_default():
+                continue
+            if role.id == jail_role.id:
+                continue  # снимаем роль заключенного
+            if role.managed or role >= guild.me.top_role:
+                new_roles.append(role)  # трогать нельзя — оставляем
+
+        for role_id in arrest_data['original_role_ids']:
+            role = guild.get_role(role_id)
+            if role and role not in new_roles and not role.managed and role < guild.me.top_role:
+                new_roles.append(role)
+
         try:
-            await member.remove_roles(jail_role, reason=reason)
+            await member.edit(roles=new_roles, reason=reason)
         except discord.Forbidden:
-            logger.error(f"Нет прав для удаления роли заключенного у {member.display_name}")
+            logger.error(f"Нет прав для изменения ролей {member.display_name}")
             return
         except Exception as e:
-            logger.error(f"Ошибка при удалении роли заключенного: {e}")
+            logger.error(f"Ошибка при возврате ролей {member.display_name}: {e}")
             return
-        
-        # Возвращаем оригинальные роли
-        original_role_ids = arrest_data['original_role_ids']
-        roles_to_add = []
-        for role_id in original_role_ids:
-            role = guild.get_role(role_id)
-            if role and role < guild.me.top_role:
-                roles_to_add.append(role)
-        
-        if roles_to_add:
-            try:
-                await member.add_roles(*roles_to_add, reason=reason)
-            except discord.Forbidden:
-                logger.error(f"Нет прав для возврата ролей {member.display_name}")
-            except Exception as e:
-                logger.error(f"Ошибка при возврате ролей: {e}")
-        
+
         # Перемещаем обратно в оригинальный канал
         if member.voice and arrest_data['original_channel_id']:
             original_channel = guild.get_channel(arrest_data['original_channel_id'])
@@ -579,15 +809,26 @@ async def release_arrested_member(member: discord.Member, arrest_data: Dict, rea
                     logger.warning(f"Нет прав для перемещения {member.display_name}")
                 except Exception as e:
                     logger.error(f"Ошибка при перемещении {member.display_name}: {e}")
-        
+
         # Удаляем из БД
-        db.remove_active_arrest(member.id)
+        await db.remove_active_arrest(member.id)
         logger.info(f"Участник {member.display_name} освобожден: {reason}")
-        
+
+        # Уведомление об освобождении (зелёный embed)
+        try:
+            guild_config = await get_guild_config(guild.id)
+            notification_channel_id = guild_config.get('arrest_notification_channel_id')
+            if notification_channel_id:
+                notification_channel = guild.get_channel(notification_channel_id)
+                if notification_channel:
+                    await notification_channel.send(embed=build_release_embed(member, reason))
+        except Exception as e:
+            logger.warning(f"Не удалось отправить уведомление об освобождении: {e}")
+
     except Exception as e:
         logger.error(f"Ошибка при освобождении участника: {e}")
         # Все равно удаляем из БД
-        db.remove_active_arrest(member.id)
+        await db.remove_active_arrest(member.id)
 
 
 async def arrest_member(
@@ -596,296 +837,264 @@ async def arrest_member(
     guild: discord.Guild,
     admin: discord.Member
 ) -> bool:
-    """Арестовывает участника на указанное время"""
-    
-    # Используем блокировку для предотвращения одновременных арестов
-    lock = get_arrest_lock(member.id)
+    """Арестовывает участника на указанное время."""
+
+    lock = arrest_locks[member.id]
     if lock.locked():
         logger.warning(f"Попытка повторного ареста {member.display_name}")
         return False
-    
-    async with lock:
-        # Проверяем, не арестован ли уже пользователь
-        if db.get_active_arrest(member.id):
-            logger.warning(f"{member.display_name} уже арестован")
-            return False
-        
-        try:
-            # Получаем настройки гильдии
-            guild_config = get_guild_config(guild.id)
-            
-            # Получаем канал тюрьмы и роль заключенного
-            jail_channel = guild.get_channel(guild_config['jail_channel_id'])
-            jail_role = guild.get_role(guild_config['jail_role_id'])
-            
-            if not jail_channel or not jail_role:
-                logger.error("Канал тюрьмы или роль заключенного не найдены в настройках")
+
+    try:
+        async with lock:
+            # Проверяем, не арестован ли уже пользователь
+            if await db.get_active_arrest(member.id):
+                logger.warning(f"{member.display_name} уже арестован")
                 return False
-            
-            # Проверяем права бота
-            if not guild.me.guild_permissions.manage_roles:
-                logger.error(f"У бота нет прав manage_roles на сервере {guild.name}")
-                return False
-            
-            if not guild.me.guild_permissions.move_members:
-                logger.error(f"У бота нет прав move_members на сервере {guild.name}")
-                return False
-            
-            # Проверяем, что роль бота выше роли заключенного
-            if jail_role >= guild.me.top_role:
-                logger.error(f"Роль бота ниже роли заключенного на сервере {guild.name}")
-                return False
-            
-            # Сохраняем текущий голосовой канал
-            original_channel_id = member.voice.channel.id if member.voice else None
-            
-            # Сохраняем текущие роли (кроме @everyone)
-            original_role_ids = [role.id for role in member.roles if role.name != "@everyone"]
-            
-            # Сохраняем в БД
-            db.save_active_arrest(
-                member.id,
-                guild.id,
-                original_channel_id,
-                original_role_ids,
-                jail_role.id,
-                duration
-            )
-            
-            # Убираем все роли
-            roles_to_remove = [role for role in member.roles if role.name != "@everyone" and role < guild.me.top_role]
-            if roles_to_remove:
-                try:
-                    await member.remove_roles(*roles_to_remove, reason=f"Арестован администратором {admin.display_name}")
-                except discord.Forbidden:
-                    logger.error(f"Нет прав для удаления ролей у {member.display_name}")
-                    db.remove_active_arrest(member.id)
-                    return False
-            
-            # Добавляем роль заключенного
+
             try:
-                await member.add_roles(jail_role, reason=f"Арестован администратором {admin.display_name}")
-            except discord.Forbidden:
-                logger.error(f"Нет прав для добавления роли заключенного {member.display_name}")
-                # Возвращаем роли обратно
-                if roles_to_remove:
-                    await member.add_roles(*roles_to_remove, reason="Откат ареста")
-                db.remove_active_arrest(member.id)
-                return False
-            
-            # Перемещаем в канал тюрьмы
-            if member.voice:
+                # Получаем настройки гильдии
+                guild_config = await get_guild_config(guild.id)
+
+                # Получаем канал тюрьмы и роль заключенного
+                jail_channel = guild.get_channel(guild_config['jail_channel_id'])
+                jail_role = guild.get_role(guild_config['jail_role_id'])
+
+                if not jail_channel or not jail_role:
+                    logger.error("Канал тюрьмы или роль заключенного не найдены в настройках")
+                    return False
+
+                # Проверяем права бота
+                if not guild.me.guild_permissions.manage_roles:
+                    logger.error(f"У бота нет прав manage_roles на сервере {guild.name}")
+                    return False
+
+                if not guild.me.guild_permissions.move_members:
+                    logger.error(f"У бота нет прав move_members на сервере {guild.name}")
+                    return False
+
+                # Проверяем, что роль бота выше роли заключенного
+                if jail_role >= guild.me.top_role:
+                    logger.error(f"Роль бота ниже роли заключенного на сервере {guild.name}")
+                    return False
+
+                # Сохраняем текущий голосовой канал
+                original_channel_id = member.voice.channel.id if member.voice else None
+
+                # Сохраняем текущие роли (кроме @everyone)
+                original_role_ids = [role.id for role in member.roles if not role.is_default()]
+
+                # Сохраняем в БД (получаем момент освобождения)
+                release_at = await db.save_active_arrest(
+                    member.id,
+                    guild.id,
+                    original_channel_id,
+                    original_role_ids,
+                    jail_role.id,
+                    duration
+                )
+
+                # Меняем роли одним вызовом member.edit:
+                # оставляем managed-роли и роли выше top_role бота (их трогать нельзя),
+                # снимаем все остальные и добавляем роль заключенного
+                new_roles = [
+                    role for role in member.roles
+                    if not role.is_default() and (role.managed or role >= guild.me.top_role)
+                ]
+                new_roles.append(jail_role)
+
                 try:
-                    await member.move_to(jail_channel, reason=f"Арестован администратором {admin.display_name}")
+                    await member.edit(
+                        roles=new_roles,
+                        reason=f"Арестован администратором {admin.display_name}"
+                    )
                 except discord.Forbidden:
-                    logger.warning(f"Нет прав для перемещения {member.display_name}")
-                except Exception as e:
-                    logger.error(f"Ошибка при перемещении в тюрьму: {e}")
-            
-            # Отправляем уведомление об аресте в текстовый канал
-            notification_channel_id = guild_config.get('arrest_notification_channel_id')
-            if notification_channel_id:
-                notification_channel = guild.get_channel(notification_channel_id)
-                if notification_channel:
-                    # Создаем View с кнопкой апелляции
-                    appeal_view = AppealButtonView(member, duration, guild.id)
-                    
-                    # Формируем сообщение
-                    voting_durations = guild_config.get('appeal_voting_durations', {})
-                    voting_time = voting_durations.get(str(duration), 0)
-                    if voting_time == 0:
-                        appeal_info = "\n\n⚠️ Апелляция недоступна для данного срока ареста."
-                    else:
-                        appeal_info = f"\n\nВы можете подать апелляцию. Время голосования: {voting_time} секунд."
-                    
+                    logger.error(f"Нет прав для изменения ролей {member.display_name}")
+                    await db.remove_active_arrest(member.id)
+                    return False
+
+                # Перемещаем в канал тюрьмы (только если участник в войсе)
+                if member.voice:
                     try:
-                        await notification_channel.send(
-                            f"{member.mention}, вас арестовали по решению {admin.mention}.{appeal_info}",
-                            view=appeal_view
-                        )
+                        await member.move_to(jail_channel, reason=f"Арестован администратором {admin.display_name}")
+                    except discord.Forbidden:
+                        logger.warning(f"Нет прав для перемещения {member.display_name}")
                     except Exception as e:
-                        logger.error(f"Ошибка при отправке уведомления об аресте: {e}")
-            
-            # Запускаем таймер освобождения
-            asyncio.create_task(release_member_after_timeout(member.id, duration))
-            
-            logger.info(f"{member.display_name} арестован на {duration} секунд администратором {admin.display_name}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Ошибка при аресте участника: {e}")
-            # Удаляем из БД в случае ошибки
-            db.remove_active_arrest(member.id)
-            return False
+                        logger.error(f"Ошибка при перемещении в тюрьму: {e}")
+
+                # Отправляем уведомление об аресте (красный embed + persistent-кнопка апелляции)
+                notification_channel_id = guild_config.get('arrest_notification_channel_id')
+                if notification_channel_id:
+                    notification_channel = guild.get_channel(notification_channel_id)
+                    if notification_channel:
+                        voting_durations = guild_config.get('appeal_voting_durations', {})
+                        voting_time = voting_durations.get(str(duration), 0)
+
+                        label = duration_label(guild_config, duration)
+                        if voting_time == 0:
+                            appeal_info = "⚠️ Апелляция недоступна для данного срока ареста."
+                            appeal_view = None
+                        else:
+                            appeal_info = "Вы можете подать апелляцию, нажав кнопку ниже."
+                            appeal_view = View(timeout=None)
+                            appeal_view.add_item(AppealButton(member.id))
+
+                        embed = build_arrest_embed(member, admin, label, release_at, appeal_info)
+                        try:
+                            if appeal_view is not None:
+                                await notification_channel.send(
+                                    content=member.mention, embed=embed, view=appeal_view
+                                )
+                            else:
+                                await notification_channel.send(content=member.mention, embed=embed)
+                        except Exception as e:
+                            logger.error(f"Ошибка при отправке уведомления об аресте: {e}")
+
+                logger.info(f"{member.display_name} арестован на {duration} секунд администратором {admin.display_name}")
+                return True
+
+            except Exception as e:
+                logger.error(f"Ошибка при аресте участника: {e}")
+                # Удаляем из БД в случае ошибки
+                await db.remove_active_arrest(member.id)
+                return False
+    finally:
+        cleanup_lock(arrest_locks, member.id)
 
 
-async def release_member_after_timeout(member_id: int, duration: int):
-    """Освобождает участника после истечения времени"""
-    
-    await asyncio.sleep(duration)
-    
-    arrest_data = db.get_active_arrest(member_id)
-    if not arrest_data:
-        return
-    
-    guild = bot.get_guild(arrest_data['guild_id'])
-    if not guild:
-        logger.error(f"Гильдия {arrest_data['guild_id']} не найдена")
-        db.remove_active_arrest(member_id)
-        return
-    
-    member = guild.get_member(member_id)
-    if not member:
-        logger.info(f"Пользователь {member_id} покинул сервер, удаляем из списка арестованных")
-        db.remove_active_arrest(member_id)
-        return
-    
-    await release_arrested_member(member, arrest_data, "Срок ареста истек")
+async def has_admin_role(guild_id: int, member: discord.Member) -> bool:
+    """Проверяет, есть ли у пользователя права администратора или одна из админских ролей."""
+    # Безусловные супер-администраторы бота
+    if member.id in SUPER_ADMIN_IDS:
+        return True
 
-
-def has_admin_role(guild_id: int, member: discord.Member) -> bool:
-    """Проверяет, есть ли у пользователя права администратора или одна из админских ролей"""
-    # Сначала проверяем права администратора сервера
     if member.guild_permissions.administrator:
         return True
-    
-    # Затем проверяем дополнительные админские роли (если настроены)
-    guild_config = get_guild_config(guild_id)
+
+    guild_config = await get_guild_config(guild_id)
     admin_role_ids = guild_config.get('admin_role_ids', [])
-    
+
     if admin_role_ids:
-        user_role_ids = [role.id for role in member.roles]
+        user_role_ids = {role.id for role in member.roles}
         return any(role_id in user_role_ids for role_id in admin_role_ids)
-    
+
     return False
 
 
-def validate_bot_configuration(guild_id: int) -> tuple[bool, str]:
-    """Проверяет, что бот настроен для использования команды ареста"""
-    guild_config = get_guild_config(guild_id)
-    
-    # Проверяем обязательные настройки
+async def validate_bot_configuration(guild_id: int) -> tuple[bool, str]:
+    """Проверяет, что бот настроен для использования команды ареста."""
+    guild_config = await get_guild_config(guild_id)
+
     if guild_config.get('jail_channel_id', 0) == 0:
         return False, "❌ **Бот не настроен!**\nНе указан канал тюрьмы. Используйте команду `/jail-config` для настройки."
-    
+
     if guild_config.get('jail_role_id', 0) == 0:
         return False, "❌ **Бот не настроен!**\nНе указана роль заключенного. Используйте команду `/jail-config` для настройки."
-    
+
     if guild_config.get('arrest_notification_channel_id', 0) == 0:
         return False, "❌ **Бот не настроен!**\nНе указан канал для подачи апелляций. Используйте команду `/jail-config` для настройки."
-    
+
     if guild_config.get('appeal_voting_channel_id', 0) == 0:
         return False, "❌ **Бот не настроен!**\nНе указан канал голосования по апелляциям. Используйте команду `/jail-config` для настройки."
-    
+
     if not guild_config.get('arrest_durations'):
         return False, "❌ **Бот не настроен!**\nНе настроены пресеты времени ареста. Используйте команду `/jail-config` для настройки."
-    
+
     return True, ""
 
 
-@tasks.loop(minutes=1)
+async def release_expired_arrest(arrest_data: Dict):
+    """Освободить участника по просроченному аресту (под локом)."""
+    member_id = arrest_data['member_id']
+    guild = bot.get_guild(arrest_data['guild_id'])
+    if not guild:
+        await db.remove_active_arrest(member_id)
+        return
+
+    member = guild.get_member(member_id)
+    if not member:
+        logger.info(f"Пользователь {member_id} покинул сервер, удаляем из списка арестованных")
+        await db.remove_active_arrest(member_id)
+        return
+
+    lock = arrest_locks[member_id]
+    if lock.locked():
+        # Кто-то уже работает с этим участником — пропускаем до следующей итерации
+        return
+
+    async with lock:
+        # Перепроверяем под локом
+        fresh = await db.get_active_arrest(member_id)
+        if fresh:
+            await release_arrested_member(member, fresh, "Срок ареста истек")
+    cleanup_lock(arrest_locks, member_id)
+
+
+@tasks.loop(seconds=10)
 async def check_expired_arrests():
-    """Фоновая задача для проверки просроченных арестов"""
+    """Единственный механизм освобождения: проверка просроченных арестов каждые 10 сек."""
     try:
-        expired = db.get_expired_arrests()
+        expired = await db.get_expired_arrests()
         for arrest_data in expired:
-            guild = bot.get_guild(arrest_data['guild_id'])
-            if guild:
-                member = guild.get_member(arrest_data['member_id'])
-                if member:
-                    await release_arrested_member(member, arrest_data, "Срок ареста истек")
-                else:
-                    db.remove_active_arrest(arrest_data['member_id'])
-            else:
-                db.remove_active_arrest(arrest_data['member_id'])
+            await release_expired_arrest(arrest_data)
     except Exception as e:
         logger.error(f"Ошибка в check_expired_arrests: {e}")
 
 
-async def restore_active_arrests():
-    """Восстанавливает таймеры для активных арестов после перезапуска бота"""
-    try:
-        active_arrests = db.get_all_active_arrests()
-        logger.info(f"Восстановление {len(active_arrests)} активных арестов")
-        
-        for arrest_data in active_arrests:
-            # Вычисляем оставшееся время
-            from datetime import datetime
-            release_time = datetime.fromisoformat(arrest_data['release_timestamp'])
-            if release_time.tzinfo is None:
-                release_time = release_time.replace(tzinfo=timezone.utc)
-            now = datetime.now(timezone.utc)
-            remaining_seconds = (release_time - now).total_seconds()
-            
-            if remaining_seconds <= 0:
-                # Арест уже должен был закончиться
-                guild = bot.get_guild(arrest_data['guild_id'])
-                if guild:
-                    member = guild.get_member(arrest_data['member_id'])
-                    if member:
-                        await release_arrested_member(member, arrest_data, "Срок ареста истек")
-                    else:
-                        db.remove_active_arrest(arrest_data['member_id'])
-                else:
-                    db.remove_active_arrest(arrest_data['member_id'])
-            else:
-                # Запускаем таймер на оставшееся время
-                asyncio.create_task(release_member_after_timeout(arrest_data['member_id'], int(remaining_seconds)))
-                logger.info(f"Восстановлен таймер для {arrest_data['member_id']}: {int(remaining_seconds)} сек")
-    except Exception as e:
-        logger.error(f"Ошибка при восстановлении арестов: {e}")
+@check_expired_arrests.before_loop
+async def before_check_expired_arrests():
+    await bot.wait_until_ready()
 
+
+# ---------------------------------------------------------------------------
+# События
+# ---------------------------------------------------------------------------
 
 @bot.event
 async def on_ready():
-    """Событие при запуске бота"""
+    """Событие при запуске бота."""
     logger.info(f'Бот {bot.user} успешно запущен!')
     logger.info(f'ID бота: {bot.user.id}')
-    
-    # Синхронизируем slash-команды
-    try:
-        synced = await bot.tree.sync()
-        logger.info(f'Синхронизировано {len(synced)} slash-команд')
-    except Exception as e:
-        logger.error(f'Ошибка при синхронизации команд: {e}')
-    
-    # Восстанавливаем активные аресты
-    await restore_active_arrests()
-    
+
+    # Мгновенная синхронизация slash-команд на всех серверах
+    # (глобальная синхронизация из setup_hook применяется с задержкой до ~1 часа)
+    await bot.sync_guild_commands()
+
     # Запускаем фоновую задачу проверки просроченных арестов
+    # (первая итерация цикла выполнится сразу — просроченные аресты будут освобождены)
     if not check_expired_arrests.is_running():
         check_expired_arrests.start()
-    
+
     logger.info('Готов к работе!')
 
 
 @bot.event
 async def on_guild_join(guild: discord.Guild):
-    """Событие при добавлении бота на сервер"""
-    # Ждем 8 секунд перед отправкой приветственного сообщения
+    """Событие при добавлении бота на сервер."""
+    # Мгновенно синхронизируем slash-команды на новом сервере
+    try:
+        bot.tree.copy_global_to(guild=guild)
+        synced = await bot.tree.sync(guild=guild)
+        logger.info(f'Синхронизировано {len(synced)} slash-команд на новом сервере {guild.name}')
+    except Exception as e:
+        logger.error(f'Ошибка при синхронизации команд на сервере {guild.name}: {e}')
+
     await asyncio.sleep(8)
-    
-    # Определяем канал для отправки сообщения
+
     target_channel = None
-    
-    # Пытаемся использовать system channel
     if guild.system_channel and guild.system_channel.permissions_for(guild.me).send_messages:
         target_channel = guild.system_channel
     else:
-        # Ищем первый текстовый канал, в который можем писать
         for channel in guild.text_channels:
             if channel.permissions_for(guild.me).send_messages:
                 target_channel = channel
                 break
-    
-    # Если нашли подходящий канал, отправляем приветственное сообщение
+
     if target_channel:
         try:
             welcome_view = WelcomeView()
             await target_channel.send(
                 "Для первичной настройки используйте команду `/jail-config`\n"
                 "или нажмите кнопку \"Открыть панель\""
-                
                 "\n\nРоль бота должна быть выше остальных ролей на сервере (кроме админских, если он не должен сажать и их)",
                 view=welcome_view
             )
@@ -897,90 +1106,45 @@ async def on_guild_join(guild: discord.Guild):
 
 
 @bot.event
-async def on_message(message):
-    """Обработка сообщений для системы апелляций"""
-    
-    # Игнорируем сообщения от ботов
-    if message.author.bot:
-        await bot.process_commands(message)
-        return
-    
-    # Проверяем, ожидается ли текст апелляции от этого пользователя
-    if message.author.id in active_appeals:
-        appeal_data = active_appeals[message.author.id]
-        
-        if appeal_data.get('status') == 'awaiting_text':
-            # Получаем текст апелляции
-            appeal_text = message.content
-            
-            # Удаляем сообщение пользователя
-            try:
-                await message.delete()
-            except discord.Forbidden:
-                logger.warning(f"Нет прав для удаления сообщения от {message.author.display_name}")
-            except Exception as e:
-                logger.error(f"Ошибка при удалении сообщения апелляции: {e}")
-            
-            # Обновляем статус в уведомлении
-            try:
-                await appeal_data['message'].edit(
-                    content=f"{message.author.mention}, апелляция на рассмотрении...",
-                    view=None
-                )
-            except discord.NotFound:
-                logger.warning("Сообщение с апелляцией не найдено")
-            except Exception as e:
-                logger.error(f"Ошибка при обновлении сообщения апелляции: {e}")
-            
-            # Отправляем апелляцию в канал голосования
-            guild_config = get_guild_config(appeal_data['guild_id'])
-            appeal_channel_id = guild_config.get('appeal_voting_channel_id')
-            if appeal_channel_id:
-                appeal_channel = message.guild.get_channel(appeal_channel_id)
-                if appeal_channel:
-                    # Определяем время голосования
-                    voting_durations = guild_config.get('appeal_voting_durations', {})
-                    voting_duration = voting_durations.get(str(appeal_data['duration']), 30)
-                    
-                    # Создаем View с кнопками голосования
-                    voting_view = AppealVotingView(message.author, voting_duration, appeal_data['guild_id'])
-                    
-                    # Отправляем сообщение с апелляцией
-                    try:
-                        voting_message = await appeal_channel.send(
-                            f"**Апелляция от {message.author.mention}**\n\n"
-                            f"**Текст апелляции:**\n{appeal_text}\n\n"
-                            f"**Примите решение** (голосование: {voting_duration} сек):",
-                            view=voting_view
-                        )
-                        
-                        # Сохраняем ссылку на сообщение для обновления после голосования
-                        voting_view.message = voting_message
-                        
-                        # Обновляем статус апелляции
-                        active_appeals[message.author.id]['status'] = 'voting'
-                        
-                    except Exception as e:
-                        logger.error(f"Ошибка при отправке апелляции в канал голосования: {e}")
-                        # Удаляем из активных апелляций при ошибке
-                        del active_appeals[message.author.id]
-            
-            return
-    
-    # Обрабатываем команды
-    await bot.process_commands(message)
+async def on_guild_remove(guild: discord.Guild):
+    """Событие при удалении бота с сервера: чистим кэш настроек."""
+    invalidate_guild_cache(guild.id)
+    logger.info(f'Бот удален с сервера {guild.name} (ID: {guild.id}), кэш настроек очищен')
 
 
-# Slash-команда для настройки бота
+# ---------------------------------------------------------------------------
+# Slash-команды
+# ---------------------------------------------------------------------------
+
+async def duration_autocomplete(
+    interaction: discord.Interaction,
+    current: str
+) -> List[app_commands.Choice[str]]:
+    """Autocomplete по пресетам длительности ареста гильдии (label -> seconds)."""
+    try:
+        guild_config = await get_guild_config(interaction.guild_id)
+    except Exception:
+        return []
+    durations = guild_config.get('arrest_durations', [])
+    current_lower = (current or "").lower()
+    choices = []
+    for d in durations:
+        label = d.get('label', '')
+        seconds = d.get('seconds', 0)
+        if current_lower in label.lower() or current_lower in str(seconds):
+            choices.append(app_commands.Choice(name=label, value=str(seconds)))
+    return choices[:25]
+
+
 @bot.tree.command(name="jail-config", description="Открыть панель настроек бота")
 async def jail_config(interaction: discord.Interaction):
-    """Открыть панель настроек бота"""
+    """Открыть панель настроек бота."""
 
     # Чтобы не получить Unknown interaction при долгой обработке
     await interaction.response.defer(ephemeral=True, thinking=True)
 
     # Проверяем права доступа
-    if not has_admin_role(interaction.guild_id, interaction.user):
+    if not await has_admin_role(interaction.guild_id, interaction.user):
         await send_interaction_message(
             interaction,
             "❌ У вас нет прав для использования этой команды!",
@@ -988,107 +1152,256 @@ async def jail_config(interaction: discord.Interaction):
         )
         return
 
-    # Получаем текущие настройки или создаем по умолчанию
-    guild_settings = await asyncio.to_thread(db.get_or_create_guild_settings, interaction.guild_id)
+    guild_settings = await db.get_or_create_guild_settings(interaction.guild_id)
 
-    # Создаем черновик настроек
     draft = ConfigDraft(interaction.guild_id, guild_settings)
-
-    # Создаем главную панель
     panel = MainConfigPanel(bot, draft, interaction.user.id)
+    embed, view = panel.get_current_screen()
 
-    # Получаем начальный экран
-    content, view = panel.get_current_screen()
-
-    # Отправляем панель
     panel.message = await interaction.followup.send(
-        content,
+        embed=embed,
         view=view,
         ephemeral=True,
         wait=True
     )
 
 
+@bot.tree.command(name="arrest", description="Арестовать участника на указанный срок")
+@app_commands.describe(
+    member="Участник, которого нужно арестовать",
+    duration="Срок ареста (выберите пресет)"
+)
+@app_commands.autocomplete(duration=duration_autocomplete)
+async def arrest_slash(interaction: discord.Interaction, member: discord.Member, duration: str):
+    """Slash-команда ареста участника."""
+    if not await has_admin_role(interaction.guild_id, interaction.user):
+        await interaction.response.send_message(
+            "❌ У вас нет прав для использования этой команды!", ephemeral=True
+        )
+        return
+
+    is_configured, error_message = await validate_bot_configuration(interaction.guild_id)
+    if not is_configured:
+        await interaction.response.send_message(error_message, ephemeral=True)
+        return
+
+    if member.bot:
+        await interaction.response.send_message("❌ Нельзя арестовать бота!", ephemeral=True)
+        return
+
+    if member.id == interaction.user.id:
+        await interaction.response.send_message("❌ Нельзя арестовать самого себя!", ephemeral=True)
+        return
+
+    # Парсим длительность (autocomplete возвращает seconds строкой)
+    try:
+        duration_seconds = int(duration.strip())
+    except ValueError:
+        # Может быть введен label пресета вручную
+        guild_config = await get_guild_config(interaction.guild_id)
+        duration_seconds = None
+        for d in guild_config.get('arrest_durations', []):
+            if d.get('label', '').lower() == duration.strip().lower():
+                duration_seconds = d['seconds']
+                break
+        if duration_seconds is None:
+            await interaction.response.send_message(
+                "❌ Некорректный срок ареста! Выберите пресет из списка.", ephemeral=True
+            )
+            return
+
+    if duration_seconds <= 0:
+        await interaction.response.send_message(
+            "❌ Срок ареста должен быть положительным!", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    guild_config = await get_guild_config(interaction.guild_id)
+    label = duration_label(guild_config, duration_seconds)
+
+    success = await arrest_member(member, duration_seconds, interaction.guild, interaction.user)
+
+    if success:
+        await interaction.followup.send(
+            f"✅ {member.display_name} арестован на {label}!", ephemeral=True
+        )
+    else:
+        await interaction.followup.send(
+            f"❌ Не удалось арестовать {member.display_name}. Возможно, он уже арестован или у бота не хватает прав.",
+            ephemeral=True
+        )
+
+
+@bot.tree.command(name="release", description="Досрочно освободить арестованного участника")
+@app_commands.describe(member="Участник, которого нужно освободить")
+async def release_slash(interaction: discord.Interaction, member: discord.Member):
+    """Slash-команда досрочного освобождения."""
+    if not await has_admin_role(interaction.guild_id, interaction.user):
+        await interaction.response.send_message(
+            "❌ У вас нет прав для использования этой команды!", ephemeral=True
+        )
+        return
+
+    arrest_data = await db.get_active_arrest(member.id)
+    if not arrest_data:
+        await interaction.response.send_message(
+            f"❌ {member.display_name} не находится под арестом!", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    async with arrest_locks[member.id]:
+        arrest_data = await db.get_active_arrest(member.id)
+        if arrest_data:
+            await release_arrested_member(
+                member, arrest_data, f"Досрочно освобожден {interaction.user.display_name}"
+            )
+    cleanup_lock(arrest_locks, member.id)
+
+    await interaction.followup.send(
+        f"✅ {member.display_name} досрочно освобожден!", ephemeral=True
+    )
+
+
+@bot.tree.command(name="sleep", description="Отключить участника из голосового канала")
+@app_commands.describe(member="Участник (необязательно — без него будет показан список)")
+async def sleep_slash(interaction: discord.Interaction, member: Optional[discord.Member] = None):
+    """Slash-команда отключения участника из голосового канала."""
+    if not await has_admin_role(interaction.guild_id, interaction.user):
+        await interaction.response.send_message(
+            "❌ У вас нет прав для использования этой команды!", ephemeral=True
+        )
+        return
+
+    if member is not None:
+        if not member.voice or not member.voice.channel:
+            await interaction.response.send_message(
+                f"❌ {member.display_name} не находится в голосовом канале!", ephemeral=True
+            )
+            return
+
+        try:
+            await member.move_to(None, reason=f"Отключен командой /sleep от {interaction.user.display_name}")
+            await interaction.response.send_message(
+                f"✅ {member.display_name} отключен из голосового канала!", ephemeral=True
+            )
+            logger.info(f"{member.display_name} отключен из голосового канала администратором {interaction.user.display_name}")
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                f"❌ Нет прав для отключения {member.display_name}!", ephemeral=True
+            )
+            logger.error(f"Нет прав для отключения {member.display_name}")
+        except Exception as e:
+            await interaction.response.send_message(
+                f"❌ Ошибка при отключении {member.display_name}!", ephemeral=True
+            )
+            logger.error(f"Ошибка при отключении {member.display_name}: {e}")
+        return
+
+    # Участник не указан — показываем Select со всеми участниками голосовых каналов
+    members_in_voice = []
+    for voice_channel in interaction.guild.voice_channels:
+        for member_in_channel in voice_channel.members:
+            if not member_in_channel.bot:
+                members_in_voice.append(member_in_channel)
+
+    if not members_in_voice:
+        await interaction.response.send_message(
+            "❌ На сервере нет пользователей в голосовых каналах!", ephemeral=True
+        )
+        return
+
+    view = SleepMemberSelectView(members_in_voice, interaction.user)
+    await interaction.response.send_message(
+        "😴 Кого отключить из голосового канала?", view=view, ephemeral=True
+    )
+
+
+# ---------------------------------------------------------------------------
+# Префиксные команды (сохранены для совместимости)
+# ---------------------------------------------------------------------------
+
 @bot.command(name='арест')
 async def arrest_command(ctx: commands.Context):
-    """Команда для ареста участника голосового канала"""
-    
-    # Проверяем права доступа
-    if not has_admin_role(ctx.guild.id, ctx.author):
+    """Команда для ареста участника голосового канала."""
+
+    if not await has_admin_role(ctx.guild.id, ctx.author):
         await ctx.send("❌ У вас нет прав для использования этой команды!")
         return
-    
-    # Проверяем конфигурацию бота
-    is_configured, error_message = validate_bot_configuration(ctx.guild.id)
+
+    is_configured, error_message = await validate_bot_configuration(ctx.guild.id)
     if not is_configured:
         await ctx.send(error_message)
         return
-    
+
     # Проверяем, находится ли админ в голосовом канале
     if not ctx.author.voice or not ctx.author.voice.channel:
         await ctx.send("❌ Вы не в голосовом чате!")
         return
-    
-    # Получаем голосовой канал админа
+
     voice_channel = ctx.author.voice.channel
-    
-    # Получаем список участников канала (кроме админа и ботов)
+
     members = [
         member for member in voice_channel.members
         if member.id != ctx.author.id and not member.bot
     ]
-    
+
     if not members:
         await ctx.send("❌ В голосовом канале нет других участников для ареста!")
         return
-    
-    # Создаем View с кнопками участников
-    view = MemberSelectView(members, ctx.author, ctx.guild.id)
+
+    # Настройки загружаем заранее — конструктор View не обращается к БД
+    guild_config = await get_guild_config(ctx.guild.id)
+
+    view = MemberSelectView(members, ctx.author, ctx.guild.id, guild_config)
     await ctx.send("👮 Кого арестовать?", view=view)
 
 
 @arrest_command.error
 async def arrest_command_error(ctx: commands.Context, error):
-    """Обработка ошибок команды арест"""
+    """Обработка ошибок команды арест."""
     await ctx.send(f"❌ Произошла ошибка: {str(error)}")
     logger.error(f"Ошибка в команде арест: {error}", exc_info=error)
 
 
 @bot.command(name='освободить')
 async def release_command(ctx: commands.Context, member: discord.Member):
-    """Команда для досрочного освобождения участника"""
-    
-    # Проверяем права доступа
-    if not has_admin_role(ctx.guild.id, ctx.author):
+    """Команда для досрочного освобождения участника."""
+
+    if not await has_admin_role(ctx.guild.id, ctx.author):
         await ctx.send("❌ У вас нет прав для использования этой команды!")
         return
-    
-    arrest_data = db.get_active_arrest(member.id)
+
+    arrest_data = await db.get_active_arrest(member.id)
     if not arrest_data:
         await ctx.send(f"❌ {member.display_name} не находится под арестом!")
         return
-    
-    await release_arrested_member(member, arrest_data, f"Досрочно освобожден {ctx.author.display_name}")
+
+    async with arrest_locks[member.id]:
+        arrest_data = await db.get_active_arrest(member.id)
+        if arrest_data:
+            await release_arrested_member(member, arrest_data, f"Досрочно освобожден {ctx.author.display_name}")
+    cleanup_lock(arrest_locks, member.id)
+
     await ctx.send(f"✅ {member.display_name} досрочно освобожден!")
 
 
 @bot.command(name='спать')
 async def sleep_command(ctx: commands.Context, member: Optional[discord.Member] = None):
-    """Команда для отключения пользователя из голосового канала"""
-    
-    # Проверяем права доступа
-    if not has_admin_role(ctx.guild.id, ctx.author):
+    """Команда для отключения пользователя из голосового канала."""
+
+    if not await has_admin_role(ctx.guild.id, ctx.author):
         await ctx.send("❌ У вас нет прав для использования этой команды!")
         return
-    
-    # Если указан конкретный пользователь
+
     if member:
-        # Проверяем, находится ли пользователь в голосовом канале
         if not member.voice or not member.voice.channel:
             await ctx.send(f"❌ {member.display_name} не находится в голосовом канале!")
             return
-        
-        # Отключаем пользователя
+
         try:
             await member.move_to(None, reason=f"Отключен командой !спать от {ctx.author.display_name}")
             await ctx.send(f"✅ {member.display_name} отключен из голосового канала!")
@@ -1100,26 +1413,23 @@ async def sleep_command(ctx: commands.Context, member: Optional[discord.Member] 
             await ctx.send(f"❌ Ошибка при отключении {member.display_name}!")
             logger.error(f"Ошибка при отключении {member.display_name}: {e}")
     else:
-        # Если пользователь не указан, показываем кнопки со всеми пользователями в голосовых каналах
-        # Получаем всех пользователей в голосовых каналах на сервере
         members_in_voice = []
         for voice_channel in ctx.guild.voice_channels:
             for member_in_channel in voice_channel.members:
                 if not member_in_channel.bot:
                     members_in_voice.append(member_in_channel)
-        
+
         if not members_in_voice:
             await ctx.send("❌ На сервере нет пользователей в голосовых каналах!")
             return
-        
-        # Создаем View с кнопками пользователей
+
         view = SleepMemberSelectView(members_in_voice, ctx.author)
         await ctx.send("😴 Кого отключить из голосового канала?", view=view)
 
 
 @sleep_command.error
 async def sleep_command_error(ctx: commands.Context, error):
-    """Обработка ошибок команды спать"""
+    """Обработка ошибок команды спать."""
     if isinstance(error, commands.MemberNotFound):
         await ctx.send("❌ Пользователь не найден!")
     else:

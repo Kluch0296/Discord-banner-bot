@@ -6,6 +6,9 @@ config.json
 # База данных
 jail_bot.db
 jail_bot.db-journal
+# SQLite WAL-файлы (появляются при journal_mode=WAL)
+jail_bot.db-wal
+jail_bot.db-shm
 
 # Python
 __pycache__/
