@@ -76,14 +76,25 @@ class JailBot(commands.Bot):
         # команды живут только в guild-scope и появляются мгновенно.
         #
         # Одноразовая зачистка осиротевшего глобального набора: если бот ранее
-        # уже зарегистрировал команды глобально, они остаются в Discord и
-        # дублируются с guild-командами. Запуск с CLEARGLOBAL=1 удаляет их.
-        # После зачистки флаг больше не нужен — guild-набор единственный.
+        # регистрировал команды глобально (через tree.sync() без guild), они
+        # остаются в Discord и дублируются с guild-командами. Запуск с
+        # CLEARGLOBAL=1 отправляет пустой bulk-upsert в глобальный endpoint
+        # Discord — это удаляет глобальные команды на стороне Discord.
+        #
+        # Важно: шлём пустой payload напрямую через http.bulk_upsert_global_commands,
+        # а НЕ tree.sync(guild=None) — последний возьмёт команды из локального
+        # cache (_global_commands, заполненного декораторами) и зарегистрирует
+        # их глобально СНОВА. Прямой пустой payload cache не трогает, поэтому
+        # последующий copy_global_to + sync(guild=...) для серверов отработает.
         if os.environ.get('CLEARGLOBAL') == '1':
             try:
-                await self.tree.clear_commands(guild=None)
-                await self.tree.sync()
-                logger.info('Глобальные slash-команды зачищены (CLEARGLOBAL=1)')
+                if self.application_id is None:
+                    logger.warning('CLEARGLOBAL: application_id ещё не известен — пропуск')
+                else:
+                    await self.http.bulk_upsert_global_commands(
+                        self.application_id, payload=[]
+                    )
+                    logger.info('Глобальные slash-команды зачищены (CLEARGLOBAL=1)')
             except Exception as e:
                 logger.error(f'Ошибка при зачистке глобальных команд: {e}')
 
