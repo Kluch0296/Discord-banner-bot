@@ -2,6 +2,7 @@ import discord
 from discord.ext import commands, tasks
 from discord import app_commands
 from discord.ui import Button, View
+import os
 import json
 import asyncio
 import collections
@@ -69,13 +70,22 @@ class JailBot(commands.Bot):
         self.add_view(WelcomeView())
         self.add_dynamic_items(AppealButton)
 
-        # Синхронизируем slash-команды один раз (глобально;
-        # Discord распространяет глобальные команды с задержкой до ~1 часа)
-        try:
-            synced = await self.tree.sync()
-            logger.info(f'Синхронизировано {len(synced)} глобальных slash-команд')
-        except Exception as e:
-            logger.error(f'Ошибка при синхронизации команд: {e}')
+        # Раньше здесь был глобальный tree.sync(). Он дублировал команды:
+        # глобальный набор + guild-набор (см. sync_guild_commands ниже) →
+        # в клиенте каждая команда показывалась дважды. Глобальный sync убран;
+        # команды живут только в guild-scope и появляются мгновенно.
+        #
+        # Одноразовая зачистка осиротевшего глобального набора: если бот ранее
+        # уже зарегистрировал команды глобально, они остаются в Discord и
+        # дублируются с guild-командами. Запуск с CLEARGLOBAL=1 удаляет их.
+        # После зачистки флаг больше не нужен — guild-набор единственный.
+        if os.environ.get('CLEARGLOBAL') == '1':
+            try:
+                await self.tree.clear_commands(guild=None)
+                await self.tree.sync()
+                logger.info('Глобальные slash-команды зачищены (CLEARGLOBAL=1)')
+            except Exception as e:
+                logger.error(f'Ошибка при зачистке глобальных команд: {e}')
 
     async def sync_guild_commands(self):
         """Копирует глобальные команды на каждый сервер и синхронизирует их.
