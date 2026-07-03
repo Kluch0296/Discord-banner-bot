@@ -2,6 +2,7 @@ import discord
 from discord.ext import commands, tasks
 from discord import app_commands
 from discord.ui import Button, View
+import os
 import json
 import asyncio
 import collections
@@ -69,13 +70,33 @@ class JailBot(commands.Bot):
         self.add_view(WelcomeView())
         self.add_dynamic_items(AppealButton)
 
-        # Синхронизируем slash-команды один раз (глобально;
-        # Discord распространяет глобальные команды с задержкой до ~1 часа)
-        try:
-            synced = await self.tree.sync()
-            logger.info(f'Синхронизировано {len(synced)} глобальных slash-команд')
-        except Exception as e:
-            logger.error(f'Ошибка при синхронизации команд: {e}')
+        # Раньше здесь был глобальный tree.sync(). Он дублировал команды:
+        # глобальный набор + guild-набор (см. sync_guild_commands ниже) →
+        # в клиенте каждая команда показывалась дважды. Глобальный sync убран;
+        # команды живут только в guild-scope и появляются мгновенно.
+        #
+        # Одноразовая зачистка осиротевшего глобального набора: если бот ранее
+        # регистрировал команды глобально (через tree.sync() без guild), они
+        # остаются в Discord и дублируются с guild-командами. Запуск с
+        # CLEARGLOBAL=1 отправляет пустой bulk-upsert в глобальный endpoint
+        # Discord — это удаляет глобальные команды на стороне Discord.
+        #
+        # Важно: шлём пустой payload напрямую через http.bulk_upsert_global_commands,
+        # а НЕ tree.sync(guild=None) — последний возьмёт команды из локального
+        # cache (_global_commands, заполненного декораторами) и зарегистрирует
+        # их глобально СНОВА. Прямой пустой payload cache не трогает, поэтому
+        # последующий copy_global_to + sync(guild=...) для серверов отработает.
+        if os.environ.get('CLEARGLOBAL') == '1':
+            try:
+                if self.application_id is None:
+                    logger.warning('CLEARGLOBAL: application_id ещё не известен — пропуск')
+                else:
+                    await self.http.bulk_upsert_global_commands(
+                        self.application_id, payload=[]
+                    )
+                    logger.info('Глобальные slash-команды зачищены (CLEARGLOBAL=1)')
+            except Exception as e:
+                logger.error(f'Ошибка при зачистке глобальных команд: {e}')
 
     async def sync_guild_commands(self):
         """Копирует глобальные команды на каждый сервер и синхронизирует их.
