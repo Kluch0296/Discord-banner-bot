@@ -8,6 +8,7 @@ import asyncio
 import collections
 import logging
 import re
+from pathlib import Path
 from typing import Dict, List, Optional, Set
 from datetime import datetime, timedelta, timezone
 
@@ -35,6 +36,10 @@ db = Database()
 # Безусловные супер-администраторы бота (работают на любом сервере,
 # независимо от настроек гильдии и прав администратора Discord)
 SUPER_ADMIN_IDS: Set[int] = {348169652087685122}
+
+# Пользователь, при упоминании которого бот отправляет картинку в текущий чат.
+LORDKORVIN_ID = 367380988939993122
+LORDKORVIN_IMAGE = Path(__file__).resolve().parent / 'assets' / 'lordkorvin.jpg'
 
 # Кэш настроек гильдий (guild_id -> {'settings': ..., 'cached_at': ...})
 guild_settings_cache: Dict[int, Dict] = {}
@@ -1069,6 +1074,32 @@ async def before_check_expired_arrests():
 # ---------------------------------------------------------------------------
 # События
 # ---------------------------------------------------------------------------
+
+@bot.event
+async def on_message(message: discord.Message):
+    """Отправляет картинку при отдельном упоминании Lordkorvin.
+
+    Префиксные команды пропускаются, чтобы упоминание в аргументах вроде
+    ``!арест @lordkorvin`` не запускало автоматическую реакцию. Slash-команды
+    приходят через interactions и сюда не попадают.
+    """
+    if message.author.bot:
+        return
+
+    try:
+        is_prefix_command = message.content.startswith(config['command_prefix'])
+        mentions_lordkorvin = any(
+            user.id == LORDKORVIN_ID for user in message.mentions
+        )
+
+        if not is_prefix_command and mentions_lordkorvin:
+            await message.channel.send(file=discord.File(LORDKORVIN_IMAGE))
+    except Exception:
+        logger.exception('Не удалось обработать упоминание Lordkorvin')
+    finally:
+        # Не перехватываем стандартную обработку !-команд.
+        await bot.process_commands(message)
+
 
 @bot.event
 async def on_ready():
