@@ -1259,18 +1259,23 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    try:
-        is_prefix_command = message.content.startswith(config['command_prefix'])
-        mentions_lordkorvin = any(
-            user.id == LORDKORVIN_ID for user in message.mentions
-        )
+    is_prefix_command = message.content.startswith(config['command_prefix'])
+    mentions_lordkorvin = any(
+        user.id == LORDKORVIN_ID for user in message.mentions
+    )
 
-        if not is_prefix_command and mentions_lordkorvin:
+    if not is_prefix_command and mentions_lordkorvin:
+        try:
             await message.channel.send(file=discord.File(LORDKORVIN_IMAGE))
+        except Exception:
+            # Ошибка отправки картинки не должна отменять независимую
+            # обработку команды «Подтянись-ка» в том же сообщении.
+            logger.exception('Не удалось отправить картинку Lordkorvin')
 
+    try:
         await handle_voice_pull_message(message)
     except Exception:
-        logger.exception('Не удалось обработать входящее сообщение')
+        logger.exception('Не удалось обработать голосовую команду')
     finally:
         # Не перехватываем стандартную обработку !-команд.
         await bot.process_commands(message)
