@@ -8,6 +8,7 @@ import asyncio
 import collections
 import logging
 import re
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 from datetime import datetime, timedelta, timezone
@@ -52,6 +53,8 @@ appeal_locks: Dict[int, asyncio.Lock] = collections.defaultdict(asyncio.Lock)
 # Блокировки на сервер: не даём двум одновременным призывам перетянуть
 # голосовое подключение бота в разные каналы.
 voice_pull_locks: Dict[int, asyncio.Lock] = collections.defaultdict(asyncio.Lock)
+VOICE_PULL_COOLDOWN_SECONDS = 5.0
+voice_pull_cooldowns: Dict[tuple[int, int], float] = {}
 
 # Участники с активным голосованием по апелляции (защита от повторной подачи)
 active_appeal_members: Set[int] = set()
@@ -1140,10 +1143,9 @@ async def connect_bot_to_voice_channel(
     """Подключить бота к каналу с выключенными микрофоном и аудиоприёмом."""
     voice_client = guild.voice_client
     if voice_client is not None and voice_client.is_connected():
-        if voice_client.channel is None or voice_client.channel.id != channel.id:
-            await voice_client.move_to(channel)
-        # Если бот уже был подключён вручную, всё равно принудительно
-        # оставляем его muted/deafened.
+        # Отправляем перемещение и self_mute/self_deaf одним voice-state
+        # update. VoiceClient.move_to() не принимает эти флаги и временно
+        # переносит бота в канал с включёнными микрофоном и аудиоприёмом.
         await guild.change_voice_state(channel=channel, self_mute=True, self_deaf=True)
         return
 
@@ -1188,7 +1190,14 @@ async def handle_voice_pull_message(message: discord.Message):
         await message.channel.send('❌ Не удалось определить участника сервера.')
         return
 
-    async with voice_pull_locks[guild.id]:
+    voice_lock = voice_pull_locks[guild.id]
+    if command == 'pull' and voice_lock.locked():
+        # Не ставим новые призывы в очередь: первый запрос уже управляет
+        # голосовым подключением, остальные отбрасываются.
+        logger.debug('Пропущен призыв из-за занятого voice lock на сервере %s', guild.id)
+        return
+
+    async with voice_lock:
         if command == 'exit':
             if not await has_voice_admin_access(member, guild_config):
                 await message.channel.send('❌ Только владелец сервера, администратор, модератор или настроенная админская роль может отключить бота.')
@@ -1230,6 +1239,14 @@ async def handle_voice_pull_message(message: discord.Message):
                 await message.channel.send('❌ Вы не в голосовом канале.')
                 return
             destination = member.mention
+
+        now = time.monotonic()
+        cooldown_key = (guild.id, member.id)
+        last_pull_at = voice_pull_cooldowns.get(cooldown_key)
+        if last_pull_at is not None and now - last_pull_at < VOICE_PULL_COOLDOWN_SECONDS:
+            logger.debug('Пропущен призыв из-за cooldown пользователя %s на сервере %s', member.id, guild.id)
+            return
+        voice_pull_cooldowns[cooldown_key] = now
 
         try:
             await connect_bot_to_voice_channel(
