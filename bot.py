@@ -8,6 +8,7 @@ import asyncio
 import collections
 import logging
 import re
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 from datetime import datetime, timedelta, timezone
@@ -48,6 +49,20 @@ CACHE_TTL = 300  # 5 минут
 # Блокировки для предотвращения race conditions
 arrest_locks: Dict[int, asyncio.Lock] = collections.defaultdict(asyncio.Lock)
 appeal_locks: Dict[int, asyncio.Lock] = collections.defaultdict(asyncio.Lock)
+
+# Блокировки на сервер: не даём двум одновременным призывам перетянуть
+# голосовое подключение бота в разные каналы.
+voice_pull_locks: Dict[int, asyncio.Lock] = collections.defaultdict(asyncio.Lock)
+VOICE_PULL_COOLDOWN_SECONDS = 5.0
+VOICE_PULL_MOVE_TIMEOUT_SECONDS = 10.0
+VOICE_PULL_MOVE_POLL_INTERVAL_SECONDS = 0.1
+voice_pull_cooldowns: Dict[tuple[int, int], float] = {}
+
+
+def expire_voice_pull_cooldown(cooldown_key: tuple[int, int], recorded_at: float) -> None:
+    """Удалить cooldown, если его не успела заменить новая команда."""
+    if voice_pull_cooldowns.get(cooldown_key) == recorded_at:
+        voice_pull_cooldowns.pop(cooldown_key, None)
 
 # Участники с активным голосованием по апелляции (защита от повторной подачи)
 active_appeal_members: Set[int] = set()
@@ -1075,9 +1090,213 @@ async def before_check_expired_arrests():
 # События
 # ---------------------------------------------------------------------------
 
+VOICE_PULL_RE = re.compile(
+    r'^\s*подтянись-ка(?:\s+к\s+(?P<target><@!?(?P<target_id>\d+)>))?\s*$',
+    re.IGNORECASE
+)
+VOICE_EXIT_RE = re.compile(r'^\s*выйди\s*$', re.IGNORECASE)
+
+
+def parse_voice_pull_message(message: discord.Message) -> Optional[tuple[str, Optional[int]]]:
+    """Распознать команду, адресованную боту прямым упоминанием.
+
+    Возвращает ``('pull', target_id)`` для призыва или ``('exit', None)``
+    для выхода. Любой дополнительный текст/mention делает сообщение
+    обычным сообщением и не запускает голосовую функцию.
+    """
+    if message.guild is None or bot.user is None:
+        return None
+    if not any(user.id == bot.user.id for user in message.mentions):
+        return None
+
+    bot_mention = re.compile(rf'<@!?{re.escape(str(bot.user.id))}>')
+    content = bot_mention.sub('', message.content, count=1)
+
+    pull_match = VOICE_PULL_RE.fullmatch(content)
+    if pull_match:
+        target_id = pull_match.group('target_id')
+        return 'pull', int(target_id) if target_id else None
+
+    if VOICE_EXIT_RE.fullmatch(content):
+        return 'exit', None
+
+    return None
+
+
+async def has_voice_admin_access(member: discord.Member, guild_config: Optional[Dict] = None) -> bool:
+    """Проверить, может ли участник отключить бота из голосового канала."""
+    if member.id in SUPER_ADMIN_IDS:
+        return True
+
+    guild = member.guild
+    if member.id == guild.owner_id:
+        return True
+
+    permissions = member.guild_permissions
+    if permissions.administrator or permissions.moderate_members:
+        return True
+
+    if guild_config is None:
+        guild_config = await get_guild_config(guild.id)
+    admin_role_ids = guild_config.get('admin_role_ids', [])
+    user_role_ids = {role.id for role in member.roles}
+    return any(role_id in user_role_ids for role_id in admin_role_ids)
+
+
+async def connect_bot_to_voice_channel(
+    guild: discord.Guild,
+    channel: discord.abc.Connectable,
+    reason: str
+) -> None:
+    """Подключить бота к каналу с выключенными микрофоном и аудиоприёмом."""
+    voice_client = guild.voice_client
+    if voice_client is not None and voice_client.is_connected():
+        # Отправляем перемещение и self_mute/self_deaf одним voice-state
+        # update. VoiceClient.move_to() не принимает эти флаги и временно
+        # переносит бота в канал с включёнными микрофоном и аудиоприёмом.
+        await guild.change_voice_state(channel=channel, self_mute=True, self_deaf=True)
+        deadline = time.monotonic() + VOICE_PULL_MOVE_TIMEOUT_SECONDS
+        while True:
+            voice_client = guild.voice_client
+            if (
+                voice_client is not None
+                and voice_client.is_connected()
+                and voice_client.channel is not None
+                and voice_client.channel.id == channel.id
+            ):
+                break
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise asyncio.TimeoutError('Не дождались подтверждения перемещения в голосовой канал')
+            await asyncio.sleep(min(VOICE_PULL_MOVE_POLL_INTERVAL_SECONDS, remaining))
+        return
+
+    if voice_client is not None:
+        try:
+            await voice_client.disconnect(force=True)
+        except (discord.HTTPException, discord.ClientException):
+            logger.debug('Не удалось очистить старое голосовое подключение на %s', guild.id)
+
+    await channel.connect(
+        timeout=60.0,
+        reconnect=True,
+        self_mute=True,
+        self_deaf=True
+    )
+    logger.info('Бот подключился к голосовому каналу %s на сервере %s: %s', channel.id, guild.id, reason)
+
+
+async def handle_voice_pull_message(message: discord.Message):
+    """Обработать opt-in команды «подтянись-ка» и «выйди»."""
+    if message.guild is None:
+        return
+
+    parsed = parse_voice_pull_message(message)
+    if parsed is None:
+        return
+
+    command, target_id = parsed
+    guild = message.guild
+    guild_config = await get_guild_config(guild.id)
+
+    # Призыв — опциональная функция и по умолчанию отключён.
+    # Команду выхода проверяем всегда, чтобы администратор мог убрать бота
+    # даже после выключения функции в панели.
+    if command == 'pull' and not guild_config.get('voice_pull_enabled', False):
+        return
+
+    member = message.author
+    if not isinstance(member, discord.Member):
+        member = guild.get_member(message.author.id)
+    if member is None:
+        await message.channel.send('❌ Не удалось определить участника сервера.')
+        return
+
+    voice_lock = voice_pull_locks[guild.id]
+    if command == 'pull' and voice_lock.locked():
+        # Не ставим новые призывы в очередь: первый запрос уже управляет
+        # голосовым подключением, остальные отбрасываются.
+        logger.debug('Пропущен призыв из-за занятого voice lock на сервере %s', guild.id)
+        return
+
+    async with voice_lock:
+        if command == 'exit':
+            if not await has_voice_admin_access(member, guild_config):
+                await message.channel.send('❌ Только владелец сервера, администратор, модератор или настроенная админская роль может отключить бота.')
+                return
+
+            voice_client = guild.voice_client
+            if voice_client is None or not voice_client.is_connected():
+                await message.channel.send('❌ Я сейчас не нахожусь в голосовом канале.')
+                return
+
+            try:
+                await voice_client.disconnect(force=True)
+                await message.channel.send('✅ Я вышел из голосового канала.')
+                logger.info('Бот отключён из голосового канала администратором %s на сервере %s', member.id, guild.id)
+            except discord.Forbidden:
+                await message.channel.send('❌ Discord не разрешил отключить голосовое подключение бота.')
+            except Exception:
+                logger.exception('Ошибка при выходе бота из голосового канала на сервере %s', guild.id)
+                await message.channel.send('❌ Не удалось выйти из голосового канала.')
+            return
+
+        if target_id is not None:
+            target = guild.get_member(target_id)
+            if target is None:
+                await message.channel.send('❌ Не удалось найти указанного пользователя на сервере.')
+                return
+            if target.id == bot.user.id:
+                await message.channel.send('❌ Нельзя подтянуться к самому себе.')
+                return
+            target_channel = target.voice.channel if target.voice else None
+            if target_channel is None:
+                await message.channel.send(f'❌ {target.display_name} не находится в голосовом канале.')
+                return
+            channel = target_channel
+            destination = target.mention
+        else:
+            channel = member.voice.channel if member.voice else None
+            if channel is None:
+                await message.channel.send('❌ Вы не в голосовом канале.')
+                return
+            destination = member.mention
+
+        now = time.monotonic()
+        cooldown_key = (guild.id, member.id)
+        last_pull_at = voice_pull_cooldowns.get(cooldown_key)
+        if last_pull_at is not None and now - last_pull_at < VOICE_PULL_COOLDOWN_SECONDS:
+            logger.debug('Пропущен призыв из-за cooldown пользователя %s на сервере %s', member.id, guild.id)
+            return
+        voice_pull_cooldowns[cooldown_key] = now
+        asyncio.get_running_loop().call_later(
+            VOICE_PULL_COOLDOWN_SECONDS,
+            expire_voice_pull_cooldown,
+            cooldown_key,
+            now
+        )
+
+        try:
+            await connect_bot_to_voice_channel(
+                guild,
+                channel,
+                reason=f'команда от {member.display_name}'
+            )
+            await message.channel.send(f'✅ Я подключился к голосовому каналу вместе с {destination}.')
+        except discord.Forbidden:
+            await message.channel.send('❌ Мне не хватает прав для подключения к этому голосовому каналу. Проверьте «Просмотр канала» и «Подключаться».')
+            logger.error('Нет прав для подключения бота к голосовому каналу %s на сервере %s', channel.id, guild.id)
+        except (discord.ClientException, asyncio.TimeoutError):
+            await message.channel.send('❌ Не удалось подключиться к голосовому каналу. Попробуйте ещё раз.')
+            logger.exception('Ошибка голосового подключения на сервере %s', guild.id)
+        except Exception:
+            await message.channel.send('❌ Произошла ошибка при подключении к голосовому каналу.')
+            logger.exception('Неожиданная ошибка голосового подключения на сервере %s', guild.id)
+
 @bot.event
 async def on_message(message: discord.Message):
-    """Отправляет картинку при отдельном упоминании Lordkorvin.
+    """Обрабатывает mention-реакции и opt-in голосовые команды.
 
     Префиксные команды пропускаются, чтобы упоминание в аргументах вроде
     ``!арест @lordkorvin`` не запускало автоматическую реакцию. Slash-команды
@@ -1086,16 +1305,23 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    try:
-        is_prefix_command = message.content.startswith(config['command_prefix'])
-        mentions_lordkorvin = any(
-            user.id == LORDKORVIN_ID for user in message.mentions
-        )
+    is_prefix_command = message.content.startswith(config['command_prefix'])
+    mentions_lordkorvin = any(
+        user.id == LORDKORVIN_ID for user in message.mentions
+    )
 
-        if not is_prefix_command and mentions_lordkorvin:
+    if not is_prefix_command and mentions_lordkorvin:
+        try:
             await message.channel.send(file=discord.File(LORDKORVIN_IMAGE))
+        except Exception:
+            # Ошибка отправки картинки не должна отменять независимую
+            # обработку команды «Подтянись-ка» в том же сообщении.
+            logger.exception('Не удалось отправить картинку Lordkorvin')
+
+    try:
+        await handle_voice_pull_message(message)
     except Exception:
-        logger.exception('Не удалось обработать упоминание Lordkorvin')
+        logger.exception('Не удалось обработать голосовую команду')
     finally:
         # Не перехватываем стандартную обработку !-команд.
         await bot.process_commands(message)

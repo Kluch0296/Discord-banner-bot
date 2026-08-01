@@ -149,7 +149,8 @@ class MainConfigPanel:
             name="Настройки",
             value=(
                 f"⏱️ Пресетов времени ареста: {presets_count}\n"
-                f"🗳️ Настроек апелляций: {appeals_count}"
+                f"🗳️ Настроек апелляций: {appeals_count}\n"
+                f"🎙️ «Подтянись-ка»: {'✅ включена' if settings.get('voice_pull_enabled', False) else '⚪ выключена'}"
             ),
             inline=False
         )
@@ -286,20 +287,29 @@ class MainConfigPanel:
         appeals_btn.callback = self.create_navigation_callback('appeals')
         view.add_item(appeals_btn)
 
+        voice_pull_enabled = self.draft.get_draft().get('voice_pull_enabled', False)
+        voice_pull_btn = Button(
+            label=f"🎙️ Подтянись-ка: {'ВКЛ' if voice_pull_enabled else 'ВЫКЛ'}",
+            style=discord.ButtonStyle.success if voice_pull_enabled else discord.ButtonStyle.secondary,
+            row=2
+        )
+        voice_pull_btn.callback = self.voice_pull_toggle_callback
+        view.add_item(voice_pull_btn)
+
         # Кнопки управления
-        save_btn = Button(label="💾 Сохранить", style=discord.ButtonStyle.success, row=2)
+        save_btn = Button(label="💾 Сохранить", style=discord.ButtonStyle.success, row=3)
         save_btn.callback = self.save_callback
         view.add_item(save_btn)
 
-        undo_btn = Button(label="↩️ Отменить изменения", style=discord.ButtonStyle.secondary, row=2)
+        undo_btn = Button(label="↩️ Отменить изменения", style=discord.ButtonStyle.secondary, row=3)
         undo_btn.callback = self.undo_changes_callback
         view.add_item(undo_btn)
 
-        factory_reset_btn = Button(label="🏭 Сброс к заводским", style=discord.ButtonStyle.secondary, row=3)
+        factory_reset_btn = Button(label="🏭 Сброс к заводским", style=discord.ButtonStyle.secondary, row=4)
         factory_reset_btn.callback = self.create_navigation_callback('factory_reset_confirm')
         view.add_item(factory_reset_btn)
 
-        close_btn = Button(label="❌ Закрыть", style=discord.ButtonStyle.danger, row=3)
+        close_btn = Button(label="❌ Закрыть", style=discord.ButtonStyle.danger, row=4)
         close_btn.callback = self.close_callback
         view.add_item(close_btn)
 
@@ -400,6 +410,19 @@ class MainConfigPanel:
         return view
 
     # Callbacks
+
+    async def voice_pull_toggle_callback(self, interaction: discord.Interaction):
+        """Переключить opt-in функцию голосового подключения."""
+        if interaction.user.id != self.admin_id:
+            await interaction.response.send_message(
+                "❌ Только администратор может изменять настройки!",
+                ephemeral=True
+            )
+            return
+
+        current = self.draft.get_draft().get('voice_pull_enabled', False)
+        self.draft.update('voice_pull_enabled', not current)
+        await self.update_display(interaction)
 
     def create_navigation_callback(self, screen: str):
         """Создать callback для навигации"""
