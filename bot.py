@@ -54,7 +54,15 @@ appeal_locks: Dict[int, asyncio.Lock] = collections.defaultdict(asyncio.Lock)
 # голосовое подключение бота в разные каналы.
 voice_pull_locks: Dict[int, asyncio.Lock] = collections.defaultdict(asyncio.Lock)
 VOICE_PULL_COOLDOWN_SECONDS = 5.0
+VOICE_PULL_MOVE_TIMEOUT_SECONDS = 10.0
+VOICE_PULL_MOVE_POLL_INTERVAL_SECONDS = 0.1
 voice_pull_cooldowns: Dict[tuple[int, int], float] = {}
+
+
+def expire_voice_pull_cooldown(cooldown_key: tuple[int, int], recorded_at: float) -> None:
+    """Удалить cooldown, если его не успела заменить новая команда."""
+    if voice_pull_cooldowns.get(cooldown_key) == recorded_at:
+        voice_pull_cooldowns.pop(cooldown_key, None)
 
 # Участники с активным голосованием по апелляции (защита от повторной подачи)
 active_appeal_members: Set[int] = set()
@@ -1147,6 +1155,21 @@ async def connect_bot_to_voice_channel(
         # update. VoiceClient.move_to() не принимает эти флаги и временно
         # переносит бота в канал с включёнными микрофоном и аудиоприёмом.
         await guild.change_voice_state(channel=channel, self_mute=True, self_deaf=True)
+        deadline = time.monotonic() + VOICE_PULL_MOVE_TIMEOUT_SECONDS
+        while True:
+            voice_client = guild.voice_client
+            if (
+                voice_client is not None
+                and voice_client.is_connected()
+                and voice_client.channel is not None
+                and voice_client.channel.id == channel.id
+            ):
+                break
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise asyncio.TimeoutError('Не дождались подтверждения перемещения в голосовой канал')
+            await asyncio.sleep(min(VOICE_PULL_MOVE_POLL_INTERVAL_SECONDS, remaining))
         return
 
     if voice_client is not None:
@@ -1247,6 +1270,12 @@ async def handle_voice_pull_message(message: discord.Message):
             logger.debug('Пропущен призыв из-за cooldown пользователя %s на сервере %s', member.id, guild.id)
             return
         voice_pull_cooldowns[cooldown_key] = now
+        asyncio.get_running_loop().call_later(
+            VOICE_PULL_COOLDOWN_SECONDS,
+            expire_voice_pull_cooldown,
+            cooldown_key,
+            now
+        )
 
         try:
             await connect_bot_to_voice_channel(
