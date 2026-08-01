@@ -70,12 +70,22 @@ class Database:
                 jail_channel_id INTEGER DEFAULT 0,
                 jail_role_id INTEGER DEFAULT 0,
                 admin_role_ids TEXT DEFAULT '[]',
+                voice_pull_enabled INTEGER NOT NULL DEFAULT 0,
                 arrest_notification_channel_id INTEGER DEFAULT 0,
                 appeal_voting_channel_id INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
+        # Миграция существующих баз: новые опциональные настройки должны
+        # добавляться без удаления уже сохранённых настроек серверов.
+        async with self.conn.execute("PRAGMA table_info(guild_settings)") as cursor:
+            columns = {row['name'] for row in await cursor.fetchall()}
+        if 'voice_pull_enabled' not in columns:
+            await self.conn.execute(
+                "ALTER TABLE guild_settings ADD COLUMN voice_pull_enabled INTEGER NOT NULL DEFAULT 0"
+            )
 
         # Таблица пресетов времени ареста
         await self.conn.execute("""
@@ -147,6 +157,7 @@ class Database:
 
         settings = dict(row)
         settings['admin_role_ids'] = json.loads(settings['admin_role_ids'])
+        settings['voice_pull_enabled'] = bool(settings.get('voice_pull_enabled', 0))
 
         # Получаем пресеты времени ареста и настройки голосования одним запросом
         async with self.conn.execute("""
@@ -226,6 +237,7 @@ class Database:
                 jail_channel_id = ?,
                 jail_role_id = ?,
                 admin_role_ids = ?,
+                voice_pull_enabled = ?,
                 arrest_notification_channel_id = ?,
                 appeal_voting_channel_id = ?,
                 updated_at = CURRENT_TIMESTAMP
@@ -234,6 +246,7 @@ class Database:
             settings.get('jail_channel_id', 0),
             settings.get('jail_role_id', 0),
             json.dumps(settings.get('admin_role_ids', [])),
+            int(bool(settings.get('voice_pull_enabled', False))),
             settings.get('arrest_notification_channel_id', 0),
             settings.get('appeal_voting_channel_id', 0),
             guild_id
