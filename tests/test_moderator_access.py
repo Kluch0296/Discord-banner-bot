@@ -103,6 +103,43 @@ class AccessTests(unittest.IsolatedAsyncioTestCase):
                 labels = [item.label for item in sent['view'].children]
                 self.assertEqual('💾 Сохранить' in labels, not expected)
 
+    async def test_persistent_welcome_button_opens_panel_with_correct_permissions(self):
+        cases = [
+            ('discord_admin', member(administrator=True), False),
+            ('configured_admin', member(role_ids=[103]), False),
+            ('super_admin', member(user_id=next(iter(bot_module.SUPER_ADMIN_IDS))), False),
+            ('moderator', member(role_ids=[104]), True),
+            ('both_roles', member(role_ids=[103, 104]), False),
+            ('ordinary', member(), None),
+        ]
+        # A fresh persistent view uses the same custom_id after a bot restart.
+        for name, user, read_only in cases:
+            with self.subTest(name=name):
+                welcome = bot_module.WelcomeView()
+                self.assertTrue(welcome.is_persistent())
+                button = welcome.children[0]
+                self.assertEqual(button.custom_id, 'open_config_panel')
+                request = interaction(user)
+                settings_read = AsyncMock(return_value=SETTINGS)
+                with patch.object(bot_module, 'get_guild_config', AsyncMock(return_value=SETTINGS)), \
+                     patch.object(bot_module.db, 'get_or_create_guild_settings', settings_read), \
+                     patch.object(bot_module.bot, 'get_guild', return_value=fake_guild()):
+                    await button.callback(request)
+                if read_only is None:
+                    settings_read.assert_not_awaited()
+                    self.assertIn('нет прав', request.followup.send.await_args.args[0])
+                else:
+                    settings_read.assert_awaited_once_with(100)
+                    sent = request.followup.send.await_args.kwargs
+                    self.assertTrue(sent['ephemeral'])
+                    panel = sent['view'].panel
+                    self.assertEqual(panel.read_only, read_only)
+                    self.assertIs(panel.access_check, bot_module.has_command_access)
+                    self.assertIs(panel.edit_check, bot_module.has_admin_role)
+                    self.assertIs(panel.message, request.followup.send.return_value)
+                    labels = [item.label for item in sent['view'].children]
+                    self.assertEqual('💾 Сохранить' in labels, not read_only)
+
     async def test_moderator_can_run_all_six_moderation_commands(self):
         user = member(role_ids=[104])
         user.voice = SimpleNamespace(channel=SimpleNamespace(members=[]))

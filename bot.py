@@ -316,31 +316,8 @@ class WelcomeView(View):
         custom_id="open_config_panel"
     )
     async def open_config(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """Callback для открытия панели настроек."""
-        # Проверка прав ДО defer
-        if (interaction.user.id not in SUPER_ADMIN_IDS
-                and not interaction.user.guild_permissions.administrator):
-            await interaction.response.send_message(
-                "❌ Только администраторы могут открывать панель настроек!",
-                ephemeral=True
-            )
-            return
-
-        await interaction.response.defer(ephemeral=True, thinking=True)
-
-        # Получаем текущие настройки или создаем по умолчанию
-        guild_settings = await db.get_or_create_guild_settings(interaction.guild_id)
-
-        draft = ConfigDraft(interaction.guild_id, guild_settings)
-        panel = MainConfigPanel(bot, draft, interaction.user.id)
-        embed, view = panel.get_current_screen()
-
-        panel.message = await interaction.followup.send(
-            embed=embed,
-            view=view,
-            ephemeral=True,
-            wait=True
-        )
+        """Открыть панель с теми же правами, что и /jail-config."""
+        await open_config_panel(interaction)
 
 
 class MemberSelectView(View):
@@ -1423,8 +1400,7 @@ async def duration_autocomplete(
     return choices[:25]
 
 
-@bot.tree.command(name="jail-config", description="Открыть панель настроек бота")
-async def jail_config(interaction: discord.Interaction):
+async def open_config_panel(interaction: discord.Interaction):
     """Открыть панель настроек бота."""
 
     # Чтобы не получить Unknown interaction при долгой обработке
@@ -1456,6 +1432,12 @@ async def jail_config(interaction: discord.Interaction):
         ephemeral=True,
         wait=True
     )
+
+
+@bot.tree.command(name="jail-config", description="Открыть панель настроек бота")
+async def jail_config(interaction: discord.Interaction):
+    """Slash-команда открытия панели настроек."""
+    await open_config_panel(interaction)
 
 
 @bot.tree.command(name="arrest", description="Арестовать участника на указанный срок")
