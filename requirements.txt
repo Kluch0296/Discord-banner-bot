@@ -1,2 +1,2 @@
-discord.py[voice]>=2.4.0
+discord.py[voice]>=2.6.4
 aiosqlite>=0.20.0
