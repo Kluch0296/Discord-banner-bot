@@ -2,7 +2,7 @@
 import discord
 from discord import ui
 from discord.ui import Button, Select, Modal, TextInput, View
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any, Tuple, Callable, Awaitable
 import asyncio
 import copy
 import logging
@@ -81,12 +81,31 @@ class PanelView(View):
 class MainConfigPanel:
     """Главная панель настроек с навигацией"""
 
-    def __init__(self, bot, draft: ConfigDraft, admin_id: int):
+    def __init__(self, bot, draft: ConfigDraft, admin_id: int, *,
+                 access_check: Callable[[int, discord.Member], Awaitable[bool]],
+                 edit_check: Callable[[int, discord.Member], Awaitable[bool]],
+                 read_only: bool = False):
         self.bot = bot
         self.draft = draft
         self.admin_id = admin_id
+        self.read_only = read_only
+        self.access_check = access_check
+        self.edit_check = edit_check
         self.message: Optional[discord.Message] = None
         self.navigation = NavigationState()
+
+    async def check_access(self, interaction: discord.Interaction, *, edit: bool = True) -> bool:
+        """Проверить автора панели и текущие права, в том числе у старых кнопок/форм."""
+        if interaction.user.id != self.admin_id:
+            error = "❌ Только участник, открывший панель, может использовать её!"
+        elif edit and (self.read_only or not await self.edit_check(self.draft.guild_id, interaction.user)):
+            error = "❌ Изменять настройки могут только администраторы. Модераторам доступен просмотр."
+        elif not edit and not await self.access_check(self.draft.guild_id, interaction.user):
+            error = "❌ У вас больше нет доступа к настройкам бота!"
+        else:
+            return True
+        await interaction.response.send_message(error, ephemeral=True)
+        return False
 
     def format_summary(self) -> discord.Embed:
         """Сводка текущих настроек в виде Embed"""
@@ -120,6 +139,11 @@ class MainConfigPanel:
             if role:
                 admin_roles.append(role.mention)
         admin_roles_str = ", ".join(admin_roles) if admin_roles else "⚙️ Только администраторы сервера"
+        moderator_roles = [
+            role.mention for role_id in settings.get('moderator_role_ids', [])
+            if (role := guild.get_role(role_id))
+        ]
+        moderator_roles_str = ", ".join(moderator_roles) if moderator_roles else "Не назначены"
 
         presets_count = len(settings.get('arrest_durations', []))
         appeals_count = len(settings.get('appeal_voting_durations', {}))
@@ -141,7 +165,8 @@ class MainConfigPanel:
             name="Роли",
             value=(
                 f"👤 Роль заключенного: {jail_role_str}\n"
-                f"👮 Дополнительные админские роли: {admin_roles_str}"
+                f"👮 Дополнительные админские роли: {admin_roles_str}\n"
+                f"🛡️ Модераторские роли: {moderator_roles_str}"
             ),
             inline=False
         )
@@ -155,7 +180,8 @@ class MainConfigPanel:
             inline=False
         )
         embed.set_footer(
-            text="✏️ Есть несохраненные изменения!" if self.draft.has_changes()
+            text="🔎 Только просмотр — модераторы не могут менять настройки" if self.read_only
+            else "✏️ Есть несохраненные изменения!" if self.draft.has_changes()
             else "✅ Все изменения сохранены"
         )
         return embed
@@ -234,6 +260,9 @@ class MainConfigPanel:
         """Получить embed и view для текущего экрана"""
         screen = self.navigation.current_screen
 
+        if self.read_only and screen != 'main':
+            return self.get_read_only_screen(screen)
+
         if screen == 'main':
             return self.format_summary(), self.get_main_view()
         elif screen == 'channels':
@@ -267,6 +296,24 @@ class MainConfigPanel:
         else:
             return self.format_summary(), self.get_main_view()
 
+    def get_read_only_screen(self, screen: str) -> Tuple[discord.Embed, View]:
+        """Те же настройки и списки без элементов редактирования."""
+        if screen == 'arrest_durations':
+            embed = self.format_durations_list()
+        elif screen == 'appeals':
+            embed = self.format_appeals_list()
+        elif screen in ('channels', 'roles'):
+            field = self.format_summary().fields[0 if screen == 'channels' else 1]
+            embed = discord.Embed(title=field.name, description=field.value, color=discord.Color.blue())
+        else:
+            embed = self.format_summary()
+        embed.set_footer(text="🔎 Только просмотр — модераторы не могут менять настройки")
+        view = PanelView(self)
+        back_btn = Button(label="◀️ Назад", style=discord.ButtonStyle.secondary)
+        back_btn.callback = self.back_callback
+        view.add_item(back_btn)
+        return embed, view
+
     def get_main_view(self) -> View:
         """Получить главное меню"""
         view = PanelView(self)
@@ -286,6 +333,12 @@ class MainConfigPanel:
         appeals_btn = Button(label="⚖️ Апелляции", style=discord.ButtonStyle.primary, row=1)
         appeals_btn.callback = self.create_navigation_callback('appeals')
         view.add_item(appeals_btn)
+
+        if self.read_only:
+            close_btn = Button(label="❌ Закрыть", style=discord.ButtonStyle.danger, row=2)
+            close_btn.callback = self.close_callback
+            view.add_item(close_btn)
+            return view
 
         voice_pull_enabled = self.draft.get_draft().get('voice_pull_enabled', False)
         voice_pull_btn = Button(
@@ -363,7 +416,11 @@ class MainConfigPanel:
         admin_roles_btn.callback = self.admin_roles_callback
         view.add_item(admin_roles_btn)
 
-        back_btn = Button(label="◀️ Назад", style=discord.ButtonStyle.secondary, row=1)
+        moderator_roles_btn = Button(label="🛡️ Модераторские роли", style=discord.ButtonStyle.primary, row=1)
+        moderator_roles_btn.callback = self.moderator_roles_callback
+        view.add_item(moderator_roles_btn)
+
+        back_btn = Button(label="◀️ Назад", style=discord.ButtonStyle.secondary, row=2)
         back_btn.callback = self.back_callback
         view.add_item(back_btn)
 
@@ -413,11 +470,7 @@ class MainConfigPanel:
 
     async def voice_pull_toggle_callback(self, interaction: discord.Interaction):
         """Переключить opt-in функцию голосового подключения."""
-        if interaction.user.id != self.admin_id:
-            await interaction.response.send_message(
-                "❌ Только администратор может изменять настройки!",
-                ephemeral=True
-            )
+        if not await self.check_access(interaction):
             return
 
         current = self.draft.get_draft().get('voice_pull_enabled', False)
@@ -427,11 +480,7 @@ class MainConfigPanel:
     def create_navigation_callback(self, screen: str):
         """Создать callback для навигации"""
         async def callback(interaction: discord.Interaction):
-            if interaction.user.id != self.admin_id:
-                await interaction.response.send_message(
-                    "❌ Только администратор, открывший панель, может изменять настройки!",
-                    ephemeral=True
-                )
+            if not await self.check_access(interaction, edit=screen == 'factory_reset_confirm'):
                 return
 
             self.navigation.navigate_to(screen)
@@ -441,11 +490,7 @@ class MainConfigPanel:
 
     async def back_callback(self, interaction: discord.Interaction):
         """Callback для кнопки Назад"""
-        if interaction.user.id != self.admin_id:
-            await interaction.response.send_message(
-                "❌ Только администратор может изменять настройки!",
-                ephemeral=True
-            )
+        if not await self.check_access(interaction, edit=False):
             return
 
         self.navigation.go_back()
@@ -453,11 +498,7 @@ class MainConfigPanel:
 
     async def save_callback(self, interaction: discord.Interaction):
         """Callback для сохранения настроек"""
-        if interaction.user.id != self.admin_id:
-            await interaction.response.send_message(
-                "❌ Только администратор может сохранять настройки!",
-                ephemeral=True
-            )
+        if not await self.check_access(interaction):
             return
 
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -497,11 +538,7 @@ class MainConfigPanel:
 
     async def undo_changes_callback(self, interaction: discord.Interaction):
         """Callback для отмены несохранённых изменений (без обращения к БД)"""
-        if interaction.user.id != self.admin_id:
-            await interaction.response.send_message(
-                "❌ Только администратор может изменять настройки!",
-                ephemeral=True
-            )
+        if not await self.check_access(interaction):
             return
 
         self.draft.reset()
@@ -509,11 +546,7 @@ class MainConfigPanel:
 
     async def factory_reset_confirm_callback(self, interaction: discord.Interaction):
         """Callback подтверждения сброса к заводским настройкам"""
-        if interaction.user.id != self.admin_id:
-            await interaction.response.send_message(
-                "❌ Только администратор может сбрасывать настройки!",
-                ephemeral=True
-            )
+        if not await self.check_access(interaction):
             return
 
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -548,11 +581,7 @@ class MainConfigPanel:
 
     async def close_callback(self, interaction: discord.Interaction):
         """Callback для закрытия панели"""
-        if interaction.user.id != self.admin_id:
-            await interaction.response.send_message(
-                "❌ Только администратор может закрыть панель!",
-                ephemeral=True
-            )
+        if not await self.check_access(interaction, edit=False):
             return
 
         if self.draft.has_changes():
@@ -575,11 +604,27 @@ class MainConfigPanel:
 
     async def admin_roles_callback(self, interaction: discord.Interaction):
         """Callback для настройки админских ролей"""
-        if interaction.user.id != self.admin_id:
-            await interaction.response.send_message(
-                "❌ Только администратор может изменять настройки!",
-                ephemeral=True
-            )
+        await self.select_access_roles(
+            interaction, 'admin_role_ids', "👮 Выбор дополнительных админских ролей",
+            "Выберите админские роли...",
+            "Эти роли могут использовать команды, просматривать и менять настройки бота.\n"
+            "💡 Администраторы сервера также сохраняют полный доступ.",
+            min_values=1,
+        )
+
+    async def moderator_roles_callback(self, interaction: discord.Interaction):
+        """Отдельный список ролей с командами и просмотром без редактирования."""
+        await self.select_access_roles(
+            interaction, 'moderator_role_ids', "🛡️ Выбор модераторских ролей",
+            "Выберите модераторские роли...",
+            "Эти роли могут использовать команды и просматривать настройки, но не менять их.\n"
+            "Чтобы очистить список, снимите выбор со всех ролей.",
+            min_values=0,
+        )
+
+    async def select_access_roles(self, interaction: discord.Interaction, setting_key: str,
+                                  title: str, placeholder: str, description: str, *, min_values: int):
+        if not await self.check_access(interaction):
             return
 
         guild = self.bot.get_guild(self.draft.guild_id)
@@ -590,21 +635,17 @@ class MainConfigPanel:
         # Создаем view с role select
         view = PanelView(self, timeout=180)
         role_select = ui.RoleSelect(
-            placeholder="Выберите админские роли...",
-            min_values=1,
+            placeholder=placeholder,
+            min_values=min_values,
             max_values=10
         )
 
         async def role_select_callback(select_interaction: discord.Interaction):
-            if select_interaction.user.id != self.admin_id:
-                await select_interaction.response.send_message(
-                    "❌ Только администратор может изменять настройки!",
-                    ephemeral=True
-                )
+            if not await self.check_access(select_interaction):
                 return
 
             selected_role_ids = [role.id for role in role_select.values]
-            self.draft.update('admin_role_ids', selected_role_ids)
+            self.draft.update(setting_key, selected_role_ids)
 
             # Возвращаемся назад и обновляем панель
             self.navigation.go_back()
@@ -624,11 +665,8 @@ class MainConfigPanel:
         view.add_item(back_btn)
 
         embed = discord.Embed(
-            title="👮 Выбор дополнительных админских ролей",
-            description=(
-                "Выберите роли, которые смогут использовать команды бота (опционально).\n"
-                "💡 По умолчанию команды доступны всем администраторам сервера."
-            ),
+            title=title,
+            description=description,
             color=discord.Color.blue()
         )
         await interaction.response.edit_message(content=None, embed=embed, view=view)
@@ -636,11 +674,7 @@ class MainConfigPanel:
     def create_channel_callback(self, setting_key: str, setting_name: str):
         """Создать callback для выбора канала"""
         async def callback(interaction: discord.Interaction):
-            if interaction.user.id != self.admin_id:
-                await interaction.response.send_message(
-                    "❌ Только администратор может изменять настройки!",
-                    ephemeral=True
-                )
+            if not await self.check_access(interaction):
                 return
 
             select = interaction.data['values'][0]
@@ -658,11 +692,7 @@ class MainConfigPanel:
 
     async def jail_role_callback(self, interaction: discord.Interaction):
         """Callback для выбора роли заключенного"""
-        if interaction.user.id != self.admin_id:
-            await interaction.response.send_message(
-                "❌ Только администратор может изменять настройки!",
-                ephemeral=True
-            )
+        if not await self.check_access(interaction):
             return
 
         role = interaction.data['values'][0]
@@ -678,11 +708,7 @@ class MainConfigPanel:
 
     async def setup_jail_channel_callback(self, interaction: discord.Interaction):
         """Callback для настройки канала тюрьмы"""
-        if interaction.user.id != self.admin_id:
-            await interaction.response.send_message(
-                "❌ Только администратор может изменять настройки!",
-                ephemeral=True
-            )
+        if not await self.check_access(interaction):
             return
 
         view = PanelView(self, timeout=180)
@@ -712,11 +738,7 @@ class MainConfigPanel:
 
     async def setup_notif_channel_callback(self, interaction: discord.Interaction):
         """Callback для настройки канала уведомлений"""
-        if interaction.user.id != self.admin_id:
-            await interaction.response.send_message(
-                "❌ Только администратор может изменять настройки!",
-                ephemeral=True
-            )
+        if not await self.check_access(interaction):
             return
 
         view = PanelView(self, timeout=180)
@@ -746,11 +768,7 @@ class MainConfigPanel:
 
     async def setup_appeal_channel_callback(self, interaction: discord.Interaction):
         """Callback для настройки канала голосования"""
-        if interaction.user.id != self.admin_id:
-            await interaction.response.send_message(
-                "❌ Только администратор может изменять настройки!",
-                ephemeral=True
-            )
+        if not await self.check_access(interaction):
             return
 
         view = PanelView(self, timeout=180)
@@ -780,11 +798,7 @@ class MainConfigPanel:
 
     async def setup_jail_role_callback(self, interaction: discord.Interaction):
         """Callback для настройки роли заключенного"""
-        if interaction.user.id != self.admin_id:
-            await interaction.response.send_message(
-                "❌ Только администратор может изменять настройки!",
-                ephemeral=True
-            )
+        if not await self.check_access(interaction):
             return
 
         view = PanelView(self, timeout=180)
@@ -813,11 +827,7 @@ class MainConfigPanel:
 
     async def create_jail_channel_callback(self, interaction: discord.Interaction):
         """Callback для создания канала тюрьмы"""
-        if interaction.user.id != self.admin_id:
-            await interaction.response.send_message(
-                "❌ Только администратор может изменять настройки!",
-                ephemeral=True
-            )
+        if not await self.check_access(interaction):
             return
 
         modal = CreateJailChannelModal(self)
@@ -825,11 +835,7 @@ class MainConfigPanel:
 
     async def create_notification_channel_callback(self, interaction: discord.Interaction):
         """Callback для создания канала уведомлений"""
-        if interaction.user.id != self.admin_id:
-            await interaction.response.send_message(
-                "❌ Только администратор может изменять настройки!",
-                ephemeral=True
-            )
+        if not await self.check_access(interaction):
             return
 
         modal = CreateNotificationChannelModal(self)
@@ -837,11 +843,7 @@ class MainConfigPanel:
 
     async def create_appeal_channel_callback(self, interaction: discord.Interaction):
         """Callback для создания канала голосования"""
-        if interaction.user.id != self.admin_id:
-            await interaction.response.send_message(
-                "❌ Только администратор может изменять настройки!",
-                ephemeral=True
-            )
+        if not await self.check_access(interaction):
             return
 
         modal = CreateAppealChannelModal(self)
@@ -849,11 +851,7 @@ class MainConfigPanel:
 
     async def create_jail_role_callback(self, interaction: discord.Interaction):
         """Callback для создания роли заключенного"""
-        if interaction.user.id != self.admin_id:
-            await interaction.response.send_message(
-                "❌ Только администратор может изменять настройки!",
-                ephemeral=True
-            )
+        if not await self.check_access(interaction):
             return
 
         modal = CreateJailRoleModal(self)
@@ -861,11 +859,7 @@ class MainConfigPanel:
 
     async def add_duration_callback(self, interaction: discord.Interaction):
         """Callback для добавления пресета"""
-        if interaction.user.id != self.admin_id:
-            await interaction.response.send_message(
-                "❌ Только администратор может изменять настройки!",
-                ephemeral=True
-            )
+        if not await self.check_access(interaction):
             return
 
         modal = AddDurationModal(self)
@@ -873,11 +867,7 @@ class MainConfigPanel:
 
     async def edit_duration_callback(self, interaction: discord.Interaction):
         """Callback для редактирования пресета"""
-        if interaction.user.id != self.admin_id:
-            await interaction.response.send_message(
-                "❌ Только администратор может изменять настройки!",
-                ephemeral=True
-            )
+        if not await self.check_access(interaction):
             return
 
         durations = self.draft.get_draft().get('arrest_durations', [])
@@ -900,11 +890,7 @@ class MainConfigPanel:
         select = Select(placeholder="Выберите пресет...", options=options)
 
         async def select_callback(select_interaction: discord.Interaction):
-            if select_interaction.user.id != self.admin_id:
-                await select_interaction.response.send_message(
-                    "❌ Только администратор может изменять настройки!",
-                    ephemeral=True
-                )
+            if not await self.check_access(select_interaction):
                 return
 
             index = int(select_interaction.data['values'][0])
@@ -928,11 +914,7 @@ class MainConfigPanel:
 
     async def delete_duration_callback(self, interaction: discord.Interaction):
         """Callback для удаления пресета"""
-        if interaction.user.id != self.admin_id:
-            await interaction.response.send_message(
-                "❌ Только администратор может изменять настройки!",
-                ephemeral=True
-            )
+        if not await self.check_access(interaction):
             return
 
         durations = self.draft.get_draft().get('arrest_durations', [])
@@ -955,11 +937,7 @@ class MainConfigPanel:
         select = Select(placeholder="Выберите пресет для удаления...", options=options)
 
         async def select_callback(select_interaction: discord.Interaction):
-            if select_interaction.user.id != self.admin_id:
-                await select_interaction.response.send_message(
-                    "❌ Только администратор может изменять настройки!",
-                    ephemeral=True
-                )
+            if not await self.check_access(select_interaction):
                 return
 
             index = int(select_interaction.data['values'][0])
@@ -997,11 +975,7 @@ class MainConfigPanel:
 
     async def edit_appeal_callback(self, interaction: discord.Interaction):
         """Callback для редактирования времени голосования"""
-        if interaction.user.id != self.admin_id:
-            await interaction.response.send_message(
-                "❌ Только администратор может изменять настройки!",
-                ephemeral=True
-            )
+        if not await self.check_access(interaction):
             return
 
         durations = self.draft.get_draft().get('arrest_durations', [])
@@ -1024,11 +998,7 @@ class MainConfigPanel:
         select = Select(placeholder="Выберите пресет...", options=options)
 
         async def select_callback(select_interaction: discord.Interaction):
-            if select_interaction.user.id != self.admin_id:
-                await select_interaction.response.send_message(
-                    "❌ Только администратор может изменять настройки!",
-                    ephemeral=True
-                )
+            if not await self.check_access(select_interaction):
                 return
 
             arrest_seconds = int(select_interaction.data['values'][0])
@@ -1053,11 +1023,7 @@ class MainConfigPanel:
 
     async def set_appeal_defaults_callback(self, interaction: discord.Interaction):
         """Callback для установки значений по умолчанию"""
-        if interaction.user.id != self.admin_id:
-            await interaction.response.send_message(
-                "❌ Только администратор может изменять настройки!",
-                ephemeral=True
-            )
+        if not await self.check_access(interaction):
             return
 
         durations = self.draft.get_draft().get('arrest_durations', [])
@@ -1121,6 +1087,10 @@ class MainConfigPanel:
             for role_id in settings['admin_role_ids']:
                 if not guild.get_role(role_id):
                     errors.append(f"Админская роль с ID {role_id} не существует на сервере")
+
+        for role_id in settings.get('moderator_role_ids', []):
+            if not guild.get_role(role_id):
+                errors.append(f"Модераторская роль с ID {role_id} не существует на сервере")
 
         # Проверка пресетов (если указаны)
         if settings.get('arrest_durations'):
@@ -1227,6 +1197,9 @@ class AddDurationModal(Modal, title="Добавить пресет времен�
         self.panel = panel
 
     async def on_submit(self, interaction: discord.Interaction):
+        if not await self.panel.check_access(interaction):
+            return
+
         try:
             label = self.label_input.value.strip()
             seconds = int(self.seconds_input.value.strip())
@@ -1306,6 +1279,9 @@ class EditDurationModal(Modal, title="Изменить пресет"):
         self.seconds_input.default = str(duration['seconds'])
 
     async def on_submit(self, interaction: discord.Interaction):
+        if not await self.panel.check_access(interaction):
+            return
+
         try:
             label = self.label_input.value.strip()
             seconds = int(self.seconds_input.value.strip())
@@ -1372,6 +1348,9 @@ class EditAppealVotingModal(Modal, title="Настройка времени го
         self.voting_seconds_input.default = str(current_voting)
 
     async def on_submit(self, interaction: discord.Interaction):
+        if not await self.panel.check_access(interaction):
+            return
+
         try:
             voting_seconds = int(self.voting_seconds_input.value.strip())
 
@@ -1422,6 +1401,9 @@ class CreateJailChannelModal(Modal, title="Создать канал тюрьм�
         self.panel = panel
 
     async def on_submit(self, interaction: discord.Interaction):
+        if not await self.panel.check_access(interaction):
+            return
+
         await interaction.response.defer(ephemeral=True, thinking=True)
 
         try:
@@ -1483,6 +1465,9 @@ class CreateNotificationChannelModal(Modal, title="Создать канал д�
         self.panel = panel
 
     async def on_submit(self, interaction: discord.Interaction):
+        if not await self.panel.check_access(interaction):
+            return
+
         await interaction.response.defer(ephemeral=True, thinking=True)
 
         try:
@@ -1544,6 +1529,9 @@ class CreateAppealChannelModal(Modal, title="Создать канал голо�
         self.panel = panel
 
     async def on_submit(self, interaction: discord.Interaction):
+        if not await self.panel.check_access(interaction):
+            return
+
         await interaction.response.defer(ephemeral=True, thinking=True)
 
         try:
@@ -1605,6 +1593,9 @@ class CreateJailRoleModal(Modal, title="Создать роль заключен
         self.panel = panel
 
     async def on_submit(self, interaction: discord.Interaction):
+        if not await self.panel.check_access(interaction):
+            return
+
         await interaction.response.defer(ephemeral=True, thinking=True)
 
         try:

@@ -1021,6 +1021,15 @@ async def has_admin_role(guild_id: int, member: discord.Member) -> bool:
     return False
 
 
+async def has_command_access(guild_id: int, member: discord.Member) -> bool:
+    """Команды и просмотр настроек доступны администраторам и модераторам."""
+    if await has_admin_role(guild_id, member):
+        return True
+    guild_config = await get_guild_config(guild_id)
+    user_role_ids = {role.id for role in member.roles}
+    return any(role_id in user_role_ids for role_id in guild_config.get('moderator_role_ids', []))
+
+
 async def validate_bot_configuration(guild_id: int) -> tuple[bool, str]:
     """Проверяет, что бот настроен для использования команды ареста."""
     guild_config = await get_guild_config(guild_id)
@@ -1138,7 +1147,7 @@ async def has_voice_admin_access(member: discord.Member, guild_config: Optional[
 
     if guild_config is None:
         guild_config = await get_guild_config(guild.id)
-    admin_role_ids = guild_config.get('admin_role_ids', [])
+    admin_role_ids = guild_config.get('admin_role_ids', []) + guild_config.get('moderator_role_ids', [])
     user_role_ids = {role.id for role in member.roles}
     return any(role_id in user_role_ids for role_id in admin_role_ids)
 
@@ -1422,7 +1431,7 @@ async def jail_config(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True, thinking=True)
 
     # Проверяем права доступа
-    if not await has_admin_role(interaction.guild_id, interaction.user):
+    if not await has_command_access(interaction.guild_id, interaction.user):
         await send_interaction_message(
             interaction,
             "❌ У вас нет прав для использования этой команды!",
@@ -1433,7 +1442,12 @@ async def jail_config(interaction: discord.Interaction):
     guild_settings = await db.get_or_create_guild_settings(interaction.guild_id)
 
     draft = ConfigDraft(interaction.guild_id, guild_settings)
-    panel = MainConfigPanel(bot, draft, interaction.user.id)
+    panel = MainConfigPanel(
+        bot, draft, interaction.user.id,
+        read_only=not await has_admin_role(interaction.guild_id, interaction.user),
+        access_check=has_command_access,
+        edit_check=has_admin_role,
+    )
     embed, view = panel.get_current_screen()
 
     panel.message = await interaction.followup.send(
@@ -1452,7 +1466,7 @@ async def jail_config(interaction: discord.Interaction):
 @app_commands.autocomplete(duration=duration_autocomplete)
 async def arrest_slash(interaction: discord.Interaction, member: discord.Member, duration: str):
     """Slash-команда ареста участника."""
-    if not await has_admin_role(interaction.guild_id, interaction.user):
+    if not await has_command_access(interaction.guild_id, interaction.user):
         await interaction.response.send_message(
             "❌ У вас нет прав для использования этой команды!", ephemeral=True
         )
@@ -1516,7 +1530,7 @@ async def arrest_slash(interaction: discord.Interaction, member: discord.Member,
 @app_commands.describe(member="Участник, которого нужно освободить")
 async def release_slash(interaction: discord.Interaction, member: discord.Member):
     """Slash-команда досрочного освобождения."""
-    if not await has_admin_role(interaction.guild_id, interaction.user):
+    if not await has_command_access(interaction.guild_id, interaction.user):
         await interaction.response.send_message(
             "❌ У вас нет прав для использования этой команды!", ephemeral=True
         )
@@ -1548,7 +1562,7 @@ async def release_slash(interaction: discord.Interaction, member: discord.Member
 @app_commands.describe(member="Участник (необязательно — без него будет показан список)")
 async def sleep_slash(interaction: discord.Interaction, member: Optional[discord.Member] = None):
     """Slash-команда отключения участника из голосового канала."""
-    if not await has_admin_role(interaction.guild_id, interaction.user):
+    if not await has_command_access(interaction.guild_id, interaction.user):
         await interaction.response.send_message(
             "❌ У вас нет прав для использования этой команды!", ephemeral=True
         )
@@ -1606,7 +1620,7 @@ async def sleep_slash(interaction: discord.Interaction, member: Optional[discord
 async def arrest_command(ctx: commands.Context):
     """Команда для ареста участника голосового канала."""
 
-    if not await has_admin_role(ctx.guild.id, ctx.author):
+    if not await has_command_access(ctx.guild.id, ctx.author):
         await ctx.send("❌ У вас нет прав для использования этой команды!")
         return
 
@@ -1649,7 +1663,7 @@ async def arrest_command_error(ctx: commands.Context, error):
 async def release_command(ctx: commands.Context, member: discord.Member):
     """Команда для досрочного освобождения участника."""
 
-    if not await has_admin_role(ctx.guild.id, ctx.author):
+    if not await has_command_access(ctx.guild.id, ctx.author):
         await ctx.send("❌ У вас нет прав для использования этой команды!")
         return
 
@@ -1671,7 +1685,7 @@ async def release_command(ctx: commands.Context, member: discord.Member):
 async def sleep_command(ctx: commands.Context, member: Optional[discord.Member] = None):
     """Команда для отключения пользователя из голосового канала."""
 
-    if not await has_admin_role(ctx.guild.id, ctx.author):
+    if not await has_command_access(ctx.guild.id, ctx.author):
         await ctx.send("❌ У вас нет прав для использования этой команды!")
         return
 

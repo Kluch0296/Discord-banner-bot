@@ -45,7 +45,12 @@ class Database:
         await self._conn.execute("PRAGMA journal_mode=WAL")
         await self._conn.execute("PRAGMA synchronous=NORMAL")
         await self._conn.execute("PRAGMA foreign_keys=ON")
-        await self._init_database()
+        try:
+            await self._init_database()
+        except Exception:
+            await self._conn.rollback()
+            await self.close()
+            raise
         logger.info("Соединение с БД %s установлено (WAL)", self.db_path)
 
     async def close(self):
@@ -63,6 +68,8 @@ class Database:
 
     async def _init_database(self):
         """Инициализация структуры базы данных."""
+        # Все изменения схемы атомарны, включая ALTER TABLE старых баз.
+        await self.conn.execute("BEGIN")
         # Таблица настроек гильдий
         await self.conn.execute("""
             CREATE TABLE IF NOT EXISTS guild_settings (
@@ -70,6 +77,7 @@ class Database:
                 jail_channel_id INTEGER DEFAULT 0,
                 jail_role_id INTEGER DEFAULT 0,
                 admin_role_ids TEXT DEFAULT '[]',
+                moderator_role_ids TEXT NOT NULL DEFAULT '[]',
                 voice_pull_enabled INTEGER NOT NULL DEFAULT 0,
                 arrest_notification_channel_id INTEGER DEFAULT 0,
                 appeal_voting_channel_id INTEGER DEFAULT 0,
@@ -85,6 +93,10 @@ class Database:
         if 'voice_pull_enabled' not in columns:
             await self.conn.execute(
                 "ALTER TABLE guild_settings ADD COLUMN voice_pull_enabled INTEGER NOT NULL DEFAULT 0"
+            )
+        if 'moderator_role_ids' not in columns:
+            await self.conn.execute(
+                "ALTER TABLE guild_settings ADD COLUMN moderator_role_ids TEXT NOT NULL DEFAULT '[]'"
             )
 
         # Таблица пресетов времени ареста
@@ -157,6 +169,7 @@ class Database:
 
         settings = dict(row)
         settings['admin_role_ids'] = json.loads(settings['admin_role_ids'])
+        settings['moderator_role_ids'] = json.loads(settings['moderator_role_ids'])
         settings['voice_pull_enabled'] = bool(settings.get('voice_pull_enabled', 0))
 
         # Получаем пресеты времени ареста и настройки голосования одним запросом
@@ -237,6 +250,7 @@ class Database:
                 jail_channel_id = ?,
                 jail_role_id = ?,
                 admin_role_ids = ?,
+                moderator_role_ids = COALESCE(?, moderator_role_ids),
                 voice_pull_enabled = ?,
                 arrest_notification_channel_id = ?,
                 appeal_voting_channel_id = ?,
@@ -246,6 +260,8 @@ class Database:
             settings.get('jail_channel_id', 0),
             settings.get('jail_role_id', 0),
             json.dumps(settings.get('admin_role_ids', [])),
+            # Старые вызывающие стороны/черновики без нового поля не стирают список.
+            json.dumps(settings['moderator_role_ids']) if 'moderator_role_ids' in settings else None,
             int(bool(settings.get('voice_pull_enabled', False))),
             settings.get('arrest_notification_channel_id', 0),
             settings.get('appeal_voting_channel_id', 0),
