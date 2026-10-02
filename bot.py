@@ -350,6 +350,12 @@ class MemberSelectView(View):
             )
             return
 
+        if not await has_command_access(interaction.guild_id, interaction.user):
+            await interaction.response.send_message(
+                "❌ У вас больше нет прав для использования этой команды!", ephemeral=True
+            )
+            return
+
         member = self.members_by_id.get(int(self.select.values[0]))
         if member is None:
             await interaction.response.send_message("❌ Участник не найден!", ephemeral=True)
@@ -388,6 +394,12 @@ class SleepMemberSelectView(View):
             await interaction.response.send_message(
                 "Только администратор, вызвавший команду, может выбрать участника!",
                 ephemeral=True
+            )
+            return
+
+        if not await has_command_access(interaction.guild_id, interaction.user):
+            await interaction.response.send_message(
+                "❌ У вас больше нет прав для использования этой команды!", ephemeral=True
             )
             return
 
@@ -455,6 +467,12 @@ class TimeSelectView(View):
                 await interaction.response.send_message(
                     "Только администратор, вызвавший команду, может выбрать время!",
                     ephemeral=True
+                )
+                return
+
+            if not await has_command_access(interaction.guild_id, interaction.user):
+                await interaction.response.send_message(
+                    "❌ У вас больше нет прав для использования этой команды!", ephemeral=True
                 )
                 return
 

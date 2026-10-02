@@ -95,15 +95,17 @@ class MainConfigPanel:
         self.navigation = NavigationState()
 
     async def check_access(self, interaction: discord.Interaction, *, edit: bool = True) -> bool:
-        """Проверить автора панели и текущие права, в том числе у старых кнопок/форм."""
+        """Проверить автора и обновить режим панели по текущим правам."""
         if interaction.user.id != self.admin_id:
             error = "❌ Только участник, открывший панель, может использовать её!"
-        elif edit and (self.read_only or not await self.edit_check(self.draft.guild_id, interaction.user)):
-            error = "❌ Изменять настройки могут только администраторы. Модераторам доступен просмотр."
-        elif not edit and not await self.access_check(self.draft.guild_id, interaction.user):
-            error = "❌ У вас больше нет доступа к настройкам бота!"
         else:
-            return True
+            self.read_only = not await self.edit_check(self.draft.guild_id, interaction.user)
+            if edit and self.read_only:
+                error = "❌ Изменять настройки могут только администраторы. Модераторам доступен просмотр."
+            elif not edit and not await self.access_check(self.draft.guild_id, interaction.user):
+                error = "❌ У вас больше нет доступа к настройкам бота!"
+            else:
+                return True
         await interaction.response.send_message(error, ephemeral=True)
         return False
 

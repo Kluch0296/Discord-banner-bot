@@ -30,7 +30,7 @@ SETTINGS = {
 
 def member(user_id=10, role_ids=(), administrator=False, moderate_members=False):
     return SimpleNamespace(
-        id=user_id, display_name='Пользователь', roles=[SimpleNamespace(id=role_id) for role_id in role_ids],
+        id=user_id, bot=False, display_name='Пользователь', roles=[SimpleNamespace(id=role_id) for role_id in role_ids],
         guild_permissions=SimpleNamespace(administrator=administrator, moderate_members=moderate_members),
         guild=SimpleNamespace(id=100, owner_id=99),
     )
@@ -290,6 +290,149 @@ class AccessTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(discord.ui.RoleSelect, 'values', new_callable=unittest.mock.PropertyMock, return_value=[]):
             await selector.callback(interaction(user))
         self.assertEqual(panel.draft.get_draft()['moderator_role_ids'], [])
+
+    async def test_open_panel_tracks_admin_grants_and_revocations(self):
+        for grant in ('administrator', 'configured_role'):
+            with self.subTest(grant=grant):
+                user = member(role_ids=[104])
+                panel = panel_for(user, read_only=True)
+                panel.access_check = bot_module.has_command_access
+                panel.edit_check = bot_module.has_admin_role
+                with patch.object(bot_module, 'get_guild_config', AsyncMock(return_value=SETTINGS)):
+                    await panel.create_navigation_callback('roles')(interaction(user))
+                    self.assertTrue(panel.read_only)
+                    if grant == 'administrator':
+                        user.guild_permissions.administrator = True
+                    else:
+                        user.roles.append(SimpleNamespace(id=103))
+                    request = interaction(user)
+                    await panel.back_callback(request)
+                    self.assertFalse(panel.read_only)
+                    labels = [item.label for item in request.response.edit_message.await_args.kwargs['view'].children]
+                    self.assertIn('💾 Сохранить', labels)
+                    await panel.voice_pull_toggle_callback(interaction(user))
+                    self.assertFalse(panel.draft.get_draft()['voice_pull_enabled'])
+                    before = copy.deepcopy(panel.draft.get_draft())
+                    user.guild_permissions.administrator = False
+                    user.roles = [SimpleNamespace(id=104)]
+                    denied = interaction(user)
+                    await panel.voice_pull_toggle_callback(denied)
+                    denied.response.send_message.assert_awaited_once()
+                    self.assertTrue(panel.read_only)
+                    self.assertEqual(panel.draft.get_draft(), before)
+                    refreshed = interaction(user)
+                    await panel.create_navigation_callback('roles')(refreshed)
+                    self.assertEqual([item.label for item in refreshed.response.edit_message.await_args.kwargs['view'].children],
+                                     ['◀️ Назад'])
+                    denied = interaction(user)
+                    await panel.save_callback(denied)
+                    panel.bot.db.update_guild_settings.assert_not_awaited()
+                    user.roles = []
+                    self.assertFalse(await panel.check_access(interaction(user), edit=False))
+
+    async def test_all_deferred_command_views_deny_revoked_moderators(self):
+        user = member(role_ids=[104])
+        target = member(user_id=20)
+        target.voice = SimpleNamespace(channel=SimpleNamespace(id=900))
+        target.move_to = AsyncMock()
+        arrest = AsyncMock(return_value=True)
+        with patch.object(bot_module, 'get_guild_config', AsyncMock(return_value=SETTINGS)), \
+             patch.object(bot_module, 'arrest_member', arrest):
+            self.assertTrue(await bot_module.has_command_access(100, user))
+            member_view = bot_module.MemberSelectView([target], user, 100, SETTINGS)
+            time_view = bot_module.TimeSelectView(target, user, 100, SETTINGS)
+            sleep_view = bot_module.SleepMemberSelectView([target], user)
+            user.roles = []
+            for name, callback in [
+                ('member', member_view.children[0].callback),
+                ('duration', time_view.children[0].callback),
+                ('sleep', sleep_view.children[0].callback),
+            ]:
+                with self.subTest(view=name):
+                    request = interaction(user)
+                    with patch.object(discord.ui.Select, 'values', new_callable=unittest.mock.PropertyMock,
+                                      return_value=[str(target.id)]):
+                        await callback(request)
+                    request.response.send_message.assert_awaited_once()
+                    self.assertIn('нет прав', request.response.send_message.await_args.args[0])
+                    self.assertTrue(request.response.send_message.await_args.kwargs['ephemeral'])
+                    request.response.edit_message.assert_not_awaited()
+            arrest.assert_not_awaited()
+            target.move_to.assert_not_awaited()
+
+    async def test_arrest_duration_rechecks_role_revoked_after_member_selection(self):
+        user = member(role_ids=[104])
+        target = member(user_id=20)
+        view = bot_module.MemberSelectView([target], user, 100, SETTINGS)
+        with patch.object(bot_module, 'get_guild_config', AsyncMock(return_value=SETTINGS)), \
+             patch.object(bot_module, 'arrest_member', AsyncMock(return_value=True)) as arrest:
+            request = interaction(user)
+            with patch.object(discord.ui.Select, 'values', new_callable=unittest.mock.PropertyMock,
+                              return_value=[str(target.id)]):
+                await view.children[0].callback(request)
+            duration_view = request.response.edit_message.await_args.kwargs['view']
+            user.roles = []
+            request = interaction(user)
+            await duration_view.children[0].callback(request)
+            request.response.send_message.assert_awaited_once()
+            arrest.assert_not_awaited()
+
+    async def test_deferred_arrest_and_targetless_sleep_still_work_for_authorized_users(self):
+        for roles, administrator in [([104], False), ([103], False), ([], True)]:
+            with self.subTest(roles=roles, administrator=administrator):
+                user = member(role_ids=roles, administrator=administrator)
+                target = member(user_id=20)
+                target.bot = False
+                target.voice = SimpleNamespace(channel=SimpleNamespace(id=900))
+                target.move_to = AsyncMock()
+                user.voice = SimpleNamespace(channel=SimpleNamespace(members=[user, target]))
+                guild = SimpleNamespace(id=100, voice_channels=[user.voice.channel])
+                ctx = SimpleNamespace(author=user, guild=guild, send=AsyncMock())
+                with patch.object(bot_module, 'get_guild_config', AsyncMock(return_value=SETTINGS)), \
+                     patch.object(bot_module, 'validate_bot_configuration', AsyncMock(return_value=(True, ''))), \
+                     patch.object(bot_module, 'arrest_member', AsyncMock(return_value=True)) as arrest:
+                    await bot_module.arrest_command.callback(ctx)
+                    member_view = ctx.send.await_args.kwargs['view']
+                    request = interaction(user)
+                    with patch.object(discord.ui.Select, 'values', new_callable=unittest.mock.PropertyMock,
+                                      return_value=[str(target.id)]):
+                        await member_view.children[0].callback(request)
+                    duration_view = request.response.edit_message.await_args.kwargs['view']
+                    request = interaction(user)
+                    await duration_view.children[0].callback(request)
+                    arrest.assert_awaited_once_with(target, 42, user.guild, user)
+                    for slash in (False, True):
+                        request = interaction(user)
+                        request.guild = guild
+                        if slash:
+                            await bot_module.sleep_slash.callback(request)
+                            sleep_view = request.response.send_message.await_args.kwargs['view']
+                        else:
+                            await bot_module.sleep_command.callback(ctx)
+                            sleep_view = ctx.send.await_args.kwargs['view']
+                        with patch.object(discord.ui.Select, 'values', new_callable=unittest.mock.PropertyMock,
+                                          return_value=[str(target.id)]):
+                            await sleep_view.children[0].callback(interaction(user))
+                    self.assertEqual(target.move_to.await_count, 2)
+
+    async def test_other_user_cannot_use_deferred_command_views(self):
+        author = member(role_ids=[104])
+        other = member(user_id=11, administrator=True)
+        target = member(user_id=20)
+        target.move_to = AsyncMock()
+        views = [bot_module.MemberSelectView([target], author, 100, SETTINGS),
+                 bot_module.TimeSelectView(target, author, 100, SETTINGS),
+                 bot_module.SleepMemberSelectView([target], author)]
+        with patch.object(bot_module, 'has_command_access', AsyncMock(return_value=True)) as access, \
+             patch.object(bot_module, 'arrest_member', AsyncMock()) as arrest:
+            for view in views:
+                request = interaction(other)
+                await view.children[0].callback(request)
+                request.response.send_message.assert_awaited_once()
+                request.response.edit_message.assert_not_awaited()
+            access.assert_not_awaited()
+            arrest.assert_not_awaited()
+            target.move_to.assert_not_awaited()
 
     async def test_another_user_cannot_use_panel_and_revoked_viewer_denied(self):
         panel = panel_for(member(role_ids=[104]), read_only=True)
