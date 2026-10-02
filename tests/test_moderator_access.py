@@ -259,8 +259,7 @@ class AccessTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_nested_selects_recheck_access_after_opening(self):
         user = member(role_ids=[103])
-        for name in ('admin_roles_callback', 'moderator_roles_callback', 'edit_duration_callback',
-                     'delete_duration_callback', 'edit_appeal_callback'):
+        for name in ('edit_duration_callback', 'edit_appeal_callback'):
             panel = panel_for(user, read_only=False, edit_allowed=True)
             request = interaction(user)
             await getattr(panel, name)(request)
@@ -274,12 +273,13 @@ class AccessTests(unittest.IsolatedAsyncioTestCase):
         panel = panel_for(user, read_only=False, edit_allowed=True)
         request = interaction(user)
         await panel.moderator_roles_callback(request)
-        selector = request.response.edit_message.await_args.kwargs['view'].children[0]
+        modal = request.response.send_modal.await_args.args[0]
+        selector = modal.roles
         self.assertEqual(selector.min_values, 0)
         # RoleSelect.values принимает роли из обработанного Discord interaction.
         with patch.object(discord.ui.RoleSelect, 'values', new_callable=unittest.mock.PropertyMock,
                           return_value=[SimpleNamespace(id=110)]):
-            await selector.callback(interaction(user))
+            await modal.on_submit(interaction(user))
         self.assertEqual(panel.draft.get_draft()['moderator_role_ids'], [110])
         self.assertEqual(panel.draft.get_draft()['admin_role_ids'], [103])
         with patch.object(panel, 'configure_jail_role_permissions', AsyncMock()):
@@ -288,7 +288,7 @@ class AccessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(panel.bot.db.update_guild_settings.await_args.args[1]['moderator_role_ids'], [110])
         self.assertFalse(panel.draft.has_changes())
         with patch.object(discord.ui.RoleSelect, 'values', new_callable=unittest.mock.PropertyMock, return_value=[]):
-            await selector.callback(interaction(user))
+            await modal.on_submit(interaction(user))
         self.assertEqual(panel.draft.get_draft()['moderator_role_ids'], [])
 
     async def test_open_panel_tracks_admin_grants_and_revocations(self):
@@ -310,7 +310,12 @@ class AccessTests(unittest.IsolatedAsyncioTestCase):
                     self.assertFalse(panel.read_only)
                     labels = [item.label for item in request.response.edit_message.await_args.kwargs['view'].children]
                     self.assertIn('💾 Сохранить', labels)
-                    await panel.voice_pull_toggle_callback(interaction(user))
+                    voice_request = interaction(user)
+                    await panel.voice_pull_toggle_callback(voice_request)
+                    voice_modal = voice_request.response.send_modal.await_args.args[0]
+                    with patch.object(discord.ui.Select, 'values', new_callable=unittest.mock.PropertyMock,
+                                      return_value=['off']):
+                        await voice_modal.on_submit(interaction(user))
                     self.assertFalse(panel.draft.get_draft()['voice_pull_enabled'])
                     before = copy.deepcopy(panel.draft.get_draft())
                     user.guild_permissions.administrator = False

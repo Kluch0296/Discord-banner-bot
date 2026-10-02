@@ -470,14 +470,11 @@ class MainConfigPanel:
 
     # Callbacks
 
+
     async def voice_pull_toggle_callback(self, interaction: discord.Interaction):
-        """Переключить opt-in функцию голосового подключения."""
         if not await self.check_access(interaction):
             return
-
-        current = self.draft.get_draft().get('voice_pull_enabled', False)
-        self.draft.update('voice_pull_enabled', not current)
-        await self.update_display(interaction)
+        await interaction.response.send_modal(VoiceSettingsModal(self))
 
     def create_navigation_callback(self, screen: str):
         """Создать callback для навигации"""
@@ -604,74 +601,17 @@ class MainConfigPanel:
             except discord.HTTPException as e:
                 logger.warning("Не удалось удалить сообщение панели: %s", e)
 
+
     async def admin_roles_callback(self, interaction: discord.Interaction):
-        """Callback для настройки админских ролей"""
-        await self.select_access_roles(
-            interaction, 'admin_role_ids', "👮 Выбор дополнительных админских ролей",
-            "Выберите админские роли...",
-            "Эти роли могут использовать команды, просматривать и менять настройки бота.\n"
-            "💡 Администраторы сервера также сохраняют полный доступ.",
-            min_values=1,
-        )
-
-    async def moderator_roles_callback(self, interaction: discord.Interaction):
-        """Отдельный список ролей с командами и просмотром без редактирования."""
-        await self.select_access_roles(
-            interaction, 'moderator_role_ids', "🛡️ Выбор модераторских ролей",
-            "Выберите модераторские роли...",
-            "Эти роли могут использовать команды и просматривать настройки, но не менять их.\n"
-            "Чтобы очистить список, снимите выбор со всех ролей.",
-            min_values=0,
-        )
-
-    async def select_access_roles(self, interaction: discord.Interaction, setting_key: str,
-                                  title: str, placeholder: str, description: str, *, min_values: int):
         if not await self.check_access(interaction):
             return
+        await interaction.response.send_modal(AccessRolesModal(self, 'admin_role_ids'))
 
-        guild = self.bot.get_guild(self.draft.guild_id)
-        if not guild:
-            await interaction.response.send_message("❌ Ошибка: сервер не найден", ephemeral=True)
+
+    async def moderator_roles_callback(self, interaction: discord.Interaction):
+        if not await self.check_access(interaction):
             return
-
-        # Создаем view с role select
-        view = PanelView(self, timeout=180)
-        role_select = ui.RoleSelect(
-            placeholder=placeholder,
-            min_values=min_values,
-            max_values=10
-        )
-
-        async def role_select_callback(select_interaction: discord.Interaction):
-            if not await self.check_access(select_interaction):
-                return
-
-            selected_role_ids = [role.id for role in role_select.values]
-            self.draft.update(setting_key, selected_role_ids)
-
-            # Возвращаемся назад и обновляем панель
-            self.navigation.go_back()
-            embed, new_view = self.get_current_screen()
-
-            await select_interaction.response.edit_message(
-                content=None,
-                embed=embed,
-                view=new_view
-            )
-
-        role_select.callback = role_select_callback
-        view.add_item(role_select)
-
-        back_btn = Button(label="◀️ Назад", style=discord.ButtonStyle.secondary, row=1)
-        back_btn.callback = self.back_callback
-        view.add_item(back_btn)
-
-        embed = discord.Embed(
-            title=title,
-            description=description,
-            color=discord.Color.blue()
-        )
-        await interaction.response.edit_message(content=None, embed=embed, view=view)
+        await interaction.response.send_modal(AccessRolesModal(self, 'moderator_role_ids'))
 
     def create_channel_callback(self, setting_key: str, setting_name: str):
         """Создать callback для выбора канала"""
@@ -708,124 +648,37 @@ class MainConfigPanel:
 
         await interaction.response.edit_message(content=None, embed=embed, view=view)
 
+
     async def setup_jail_channel_callback(self, interaction: discord.Interaction):
-        """Callback для настройки канала тюрьмы"""
         if not await self.check_access(interaction):
             return
+        await interaction.response.send_modal(ResourceSettingModal(
+            self, 'jail_channel_id', 'Канал тюрьмы', 'voice',
+        ))
 
-        view = PanelView(self, timeout=180)
-
-        jail_channel_select = ui.ChannelSelect(
-            placeholder="🔒 Выберите существующий канал тюрьмы...",
-            channel_types=[discord.ChannelType.voice],
-            row=0
-        )
-        jail_channel_select.callback = self.create_channel_callback('jail_channel_id', 'Канал тюрьмы')
-        view.add_item(jail_channel_select)
-
-        create_btn = Button(label="➕ Создать новый канал", style=discord.ButtonStyle.success, row=1)
-        create_btn.callback = self.create_jail_channel_callback
-        view.add_item(create_btn)
-
-        back_btn = Button(label="◀️ Назад", style=discord.ButtonStyle.secondary, row=2)
-        back_btn.callback = self.back_callback
-        view.add_item(back_btn)
-
-        embed = discord.Embed(
-            title="🔒 Настройка канала тюрьмы",
-            description="Выберите существующий голосовой канал или создайте новый:",
-            color=discord.Color.blue()
-        )
-        await interaction.response.edit_message(content=None, embed=embed, view=view)
 
     async def setup_notif_channel_callback(self, interaction: discord.Interaction):
-        """Callback для настройки канала уведомлений"""
         if not await self.check_access(interaction):
             return
+        await interaction.response.send_modal(ResourceSettingModal(
+            self, 'arrest_notification_channel_id', 'Канал для подачи апелляций', 'text',
+        ))
 
-        view = PanelView(self, timeout=180)
-
-        notif_channel_select = ui.ChannelSelect(
-            placeholder="📢 Выберите существующий канал для подачи апелляций...",
-            channel_types=[discord.ChannelType.text],
-            row=0
-        )
-        notif_channel_select.callback = self.create_channel_callback('arrest_notification_channel_id', 'Канал для подачи апелляций')
-        view.add_item(notif_channel_select)
-
-        create_btn = Button(label="➕ Создать новый канал", style=discord.ButtonStyle.success, row=1)
-        create_btn.callback = self.create_notification_channel_callback
-        view.add_item(create_btn)
-
-        back_btn = Button(label="◀️ Назад", style=discord.ButtonStyle.secondary, row=2)
-        back_btn.callback = self.back_callback
-        view.add_item(back_btn)
-
-        embed = discord.Embed(
-            title="📢 Настройка канала для подачи апелляций",
-            description="Выберите существующий текстовый канал или создайте новый:",
-            color=discord.Color.blue()
-        )
-        await interaction.response.edit_message(content=None, embed=embed, view=view)
 
     async def setup_appeal_channel_callback(self, interaction: discord.Interaction):
-        """Callback для настройки канала голосования"""
         if not await self.check_access(interaction):
             return
+        await interaction.response.send_modal(ResourceSettingModal(
+            self, 'appeal_voting_channel_id', 'Канал голосования', 'text',
+        ))
 
-        view = PanelView(self, timeout=180)
-
-        appeal_channel_select = ui.ChannelSelect(
-            placeholder="⚖️ Выберите существующий канал голосования...",
-            channel_types=[discord.ChannelType.text],
-            row=0
-        )
-        appeal_channel_select.callback = self.create_channel_callback('appeal_voting_channel_id', 'Канал голосования')
-        view.add_item(appeal_channel_select)
-
-        create_btn = Button(label="➕ Создать новый канал", style=discord.ButtonStyle.success, row=1)
-        create_btn.callback = self.create_appeal_channel_callback
-        view.add_item(create_btn)
-
-        back_btn = Button(label="◀️ Назад", style=discord.ButtonStyle.secondary, row=2)
-        back_btn.callback = self.back_callback
-        view.add_item(back_btn)
-
-        embed = discord.Embed(
-            title="⚖️ Настройка канала голосования",
-            description="Выберите существующий текстовый канал или создайте новый:",
-            color=discord.Color.blue()
-        )
-        await interaction.response.edit_message(content=None, embed=embed, view=view)
 
     async def setup_jail_role_callback(self, interaction: discord.Interaction):
-        """Callback для настройки роли заключенного"""
         if not await self.check_access(interaction):
             return
-
-        view = PanelView(self, timeout=180)
-
-        jail_role_select = ui.RoleSelect(
-            placeholder="👤 Выберите существующую роль заключенного...",
-            row=0
-        )
-        jail_role_select.callback = self.jail_role_callback
-        view.add_item(jail_role_select)
-
-        create_btn = Button(label="➕ Создать новую роль", style=discord.ButtonStyle.success, row=1)
-        create_btn.callback = self.create_jail_role_callback
-        view.add_item(create_btn)
-
-        back_btn = Button(label="◀️ Назад", style=discord.ButtonStyle.secondary, row=2)
-        back_btn.callback = self.back_callback
-        view.add_item(back_btn)
-
-        embed = discord.Embed(
-            title="👤 Настройка роли заключенного",
-            description="Выберите существующую роль или создайте новую:",
-            color=discord.Color.blue()
-        )
-        await interaction.response.edit_message(content=None, embed=embed, view=view)
+        await interaction.response.send_modal(ResourceSettingModal(
+            self, 'jail_role_id', 'Роль заключенного', 'role',
+        ))
 
     async def create_jail_channel_callback(self, interaction: discord.Interaction):
         """Callback для создания канала тюрьмы"""
@@ -914,66 +767,14 @@ class MainConfigPanel:
         )
         await interaction.response.edit_message(content=None, embed=embed, view=view)
 
+
     async def delete_duration_callback(self, interaction: discord.Interaction):
-        """Callback для удаления пресета"""
         if not await self.check_access(interaction):
             return
-
-        durations = self.draft.get_draft().get('arrest_durations', [])
-        if not durations:
-            await interaction.response.send_message(
-                "❌ Нет пресетов для удаления!",
-                ephemeral=True
-            )
+        if not self.draft.get_draft().get('arrest_durations'):
+            await interaction.response.send_message("❌ Нет пресетов для удаления!", ephemeral=True)
             return
-
-        view = PanelView(self, timeout=180)
-        options = [
-            discord.SelectOption(
-                label=f"{d['label']} ({d['seconds']} сек)",
-                value=str(i)
-            )
-            for i, d in enumerate(durations)
-        ]
-
-        select = Select(placeholder="Выберите пресет для удаления...", options=options)
-
-        async def select_callback(select_interaction: discord.Interaction):
-            if not await self.check_access(select_interaction):
-                return
-
-            index = int(select_interaction.data['values'][0])
-            duration = durations[index]
-
-            # Удаляем пресет
-            durations.pop(index)
-            self.draft.update('arrest_durations', durations)
-
-            # Удаляем соответствующую настройку апелляции
-            appeals = self.draft.get_draft().get('appeal_voting_durations', {})
-            if str(duration['seconds']) in appeals:
-                appeals.pop(str(duration['seconds']))
-                self.draft.update('appeal_voting_durations', appeals)
-
-            await select_interaction.response.send_message(
-                f"✅ **Пресет удален:** {duration['label']} ({duration['seconds']} сек)",
-                ephemeral=True
-            )
-
-            await self.refresh_panel_message()
-
-        select.callback = select_callback
-        view.add_item(select)
-
-        back_btn = Button(label="◀️ Назад", style=discord.ButtonStyle.secondary, row=1)
-        back_btn.callback = self.back_callback
-        view.add_item(back_btn)
-
-        embed = discord.Embed(
-            title="🗑️ Выберите пресет для удаления",
-            color=discord.Color.blue()
-        )
-        await interaction.response.edit_message(content=None, embed=embed, view=view)
+        await interaction.response.send_modal(DeleteDurationsModal(self))
 
     async def edit_appeal_callback(self, interaction: discord.Interaction):
         """Callback для редактирования времени голосования"""
@@ -1023,38 +824,16 @@ class MainConfigPanel:
         )
         await interaction.response.edit_message(content=None, embed=embed, view=view)
 
+
     async def set_appeal_defaults_callback(self, interaction: discord.Interaction):
-        """Callback для установки значений по умолчанию"""
         if not await self.check_access(interaction):
             return
-
-        durations = self.draft.get_draft().get('arrest_durations', [])
-        if not durations:
+        if not self.draft.get_draft().get('arrest_durations'):
             await interaction.response.send_message(
-                "❌ Сначала настройте пресеты времени ареста!",
-                ephemeral=True
+                "❌ Сначала настройте пресеты времени ареста!", ephemeral=True,
             )
             return
-
-        # Устанавливаем значения по умолчанию
-        appeals = {}
-        for duration in durations:
-            seconds = duration['seconds']
-            # Для коротких сроков - 0, для длинных - пропорционально
-            if seconds <= 30:
-                default_voting = 0
-            else:
-                default_voting = max(15, min(120, seconds // 10))
-            appeals[str(seconds)] = default_voting
-
-        self.draft.update('appeal_voting_durations', appeals)
-
-        await interaction.response.send_message(
-            "✅ **Установлены значения по умолчанию для всех пресетов!**",
-            ephemeral=True
-        )
-
-        await self.refresh_panel_message()
+        await interaction.response.send_modal(AppealDefaultsModal(self))
 
     def validate_settings(self) -> List[str]:
         """Валидация настроек перед сохранением (минимальная проверка)"""
@@ -1176,6 +955,255 @@ class MainConfigPanel:
 
 
 # Модальные окна
+
+
+class SettingsModal(Modal):
+    """Конечная форма: меняет черновик и обновляет меню без перехода назад."""
+
+    def __init__(self, panel: MainConfigPanel, *, title: str):
+        super().__init__(title=title, timeout=180)
+        self.panel = panel
+
+    def add_save_hint(self):
+        self.add_item(ui.TextDisplay(
+            "Изменения попадут в черновик. Затем нажмите «💾 Сохранить» в главном меню."
+        ))
+
+    async def finish(self, interaction: discord.Interaction, message: str):
+        await interaction.response.send_message(
+            message + "\n💡 Для применения нажмите «💾 Сохранить» в главном меню.",
+            ephemeral=True,
+        )
+        await self.panel.refresh_panel_message()
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        logger.error("Ошибка формы настроек", exc_info=(type(error), error, error.__traceback__))
+        message = "❌ Не удалось применить форму. Откройте её ещё раз."
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+
+
+class AccessRolesModal(SettingsModal):
+    """Предвыбранный полный список доступа; пустой выбор очищает его."""
+
+    def __init__(self, panel: MainConfigPanel, setting_key: str):
+        admin = setting_key == 'admin_role_ids'
+        super().__init__(panel, title="Дополнительные администраторы" if admin else "Модераторские роли")
+        self.setting_key = setting_key
+        guild = panel.bot.get_guild(panel.draft.guild_id)
+        defaults = [
+            discord.Object(id=role_id)
+            for role_id in panel.draft.get_draft().get(setting_key, [])
+            if guild and guild.get_role(role_id)
+        ]
+        self.roles = ui.RoleSelect(
+            placeholder="Выберите роли с доступом к боту",
+            min_values=0, max_values=25, required=False, default_values=defaults,
+        )
+        self.add_item(ui.Label(
+            text="Роли с доступом",
+            description="Снимите выбор, чтобы убрать роль. Пустой список убирает все дополнительные роли.",
+            component=self.roles,
+        ))
+        self.add_item(ui.TextDisplay(
+            "Эти роли могут использовать команды и " +
+            ("изменять настройки. Администраторы Discord сохраняют полный доступ."
+             if admin else "просматривать настройки. Изменять настройки они не могут.")
+        ))
+        self.add_save_hint()
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not await self.panel.check_access(interaction):
+            return
+        role_ids = [role.id for role in self.roles.values]
+        guild = self.panel.bot.get_guild(self.panel.draft.guild_id)
+        if not guild or any(not guild.get_role(role_id) for role_id in role_ids):
+            await interaction.response.send_message(
+                "❌ Одна из выбранных ролей больше не существует. Откройте форму заново.", ephemeral=True,
+            )
+            return
+        self.panel.draft.update(self.setting_key, role_ids)
+        await self.finish(
+            interaction,
+            "✅ Список ролей обновлён." if role_ids else "✅ Список ролей очищен.",
+        )
+
+
+class ResourceSettingModal(SettingsModal):
+    """Выбор существующего канала/роли или создание нового в одной форме."""
+
+    def __init__(self, panel: MainConfigPanel, setting_key: str, title: str, kind: str):
+        super().__init__(panel, title=title)
+        self.setting_key, self.kind = setting_key, kind
+        guild = panel.bot.get_guild(panel.draft.guild_id)
+        current_id = panel.draft.get_draft().get(setting_key, 0)
+        current = (guild.get_role(current_id) if kind == 'role' else guild.get_channel(current_id)) if guild else None
+        defaults = [discord.Object(id=current_id)] if current_id and current else []
+        common = dict(min_values=0, max_values=1, required=False, default_values=defaults)
+        if kind == 'role':
+            self.selected = ui.RoleSelect(placeholder="Выберите существующую роль", **common)
+        else:
+            self.selected = ui.ChannelSelect(
+                placeholder="Выберите существующий канал",
+                channel_types=[discord.ChannelType.voice if kind == 'voice' else discord.ChannelType.text],
+                **common,
+            )
+        self.add_item(ui.Label(
+            text="Существующая роль" if kind == 'role' else "Существующий канал",
+            description="Выберите существующий объект или укажите название нового ниже.",
+            component=self.selected,
+        ))
+        self.new_name = TextInput(required=False, max_length=100, placeholder="Оставьте пустым для существующего")
+        self.add_item(ui.Label(
+            text="Создать новую роль вместо выбранной" if kind == 'role' else "Создать новый канал вместо выбранного",
+            description="Если заполнено, бот создаст новый объект при отправке этой формы.",
+            component=self.new_name,
+        ))
+        self.add_save_hint()
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not await self.panel.check_access(interaction):
+            return
+        guild = self.panel.bot.get_guild(self.panel.draft.guild_id)
+        if not guild:
+            await interaction.response.send_message("❌ Сервер не найден.", ephemeral=True)
+            return
+        name = self.new_name.value.strip()
+        selected_id = self.selected.values[0].id if self.selected.values else 0
+        if not name:
+            resource = (guild.get_role(selected_id) if self.kind == 'role'
+                        else guild.get_channel(selected_id)) if selected_id else None
+            if selected_id and (not resource or (self.kind != 'role' and resource.type not in self.selected.channel_types)):
+                await interaction.response.send_message(
+                    "❌ Выбранный объект недоступен. Откройте форму заново.", ephemeral=True,
+                )
+                return
+            if not selected_id and self.setting_key in ('jail_channel_id', 'jail_role_id'):
+                await interaction.response.send_message(
+                    "❌ Выберите существующий объект или укажите название нового.", ephemeral=True,
+                )
+                return
+            self.panel.draft.update(self.setting_key, selected_id)
+            await self.finish(interaction, "✅ Выбор обновлён." if selected_id else "✅ Канал отключён.")
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            if self.kind == 'role':
+                resource = await guild.create_role(
+                    name=name, color=discord.Color.dark_gray(),
+                    permissions=discord.Permissions.none(), reason="Создана через панель настроек бота",
+                )
+            elif self.kind == 'voice':
+                resource = await guild.create_voice_channel(name=name, reason="Создан через панель настроек бота")
+            else:
+                resource = await guild.create_text_channel(name=name, reason="Создан через панель настроек бота")
+            self.panel.draft.update(self.setting_key, resource.id)
+            await interaction.followup.send(
+                "✅ Новый объект создан и выбран.\n"
+                "💡 Для применения нажмите «💾 Сохранить» в главном меню.",
+                ephemeral=True,
+            )
+            await self.panel.refresh_panel_message()
+        except discord.Forbidden:
+            await interaction.followup.send("❌ У бота нет прав для создания выбранного объекта.", ephemeral=True)
+        except discord.HTTPException:
+            logger.exception("Не удалось создать объект через форму настроек")
+            await interaction.followup.send(
+                "❌ Discord не смог создать объект. Проверьте название и повторите попытку.", ephemeral=True,
+            )
+
+
+class VoiceSettingsModal(SettingsModal):
+    def __init__(self, panel: MainConfigPanel):
+        super().__init__(panel, title="Подтянись-ка")
+        enabled = panel.draft.get_draft().get('voice_pull_enabled', False)
+        self.enabled = Select(options=[
+            discord.SelectOption(label="Включено", value="on", default=enabled),
+            discord.SelectOption(label="Выключено", value="off", default=not enabled),
+        ], required=True)
+        self.add_item(ui.Label(
+            text="Подключение бота к голосовым каналам",
+            description="Разрешить участникам призывать бота командой «подтянись-ка».",
+            component=self.enabled,
+        ))
+        self.add_save_hint()
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not await self.panel.check_access(interaction):
+            return
+        self.panel.draft.update('voice_pull_enabled', self.enabled.values[0] == 'on')
+        await self.finish(interaction, "✅ Настройка подключения обновлена.")
+
+
+class DeleteDurationsModal(SettingsModal):
+    def __init__(self, panel: MainConfigPanel):
+        super().__init__(panel, title="Удалить пресеты времени ареста")
+        self.snapshot = copy.deepcopy(panel.draft.get_draft().get('arrest_durations', []))
+        self.presets = Select(
+            placeholder="Выберите пресеты для удаления", min_values=1,
+            max_values=len(self.snapshot), required=True,
+            options=[discord.SelectOption(
+                label=f"{d['label']} ({d['seconds']} сек)", value=str(d['seconds']),
+            ) for d in self.snapshot],
+        )
+        self.add_item(ui.Label(
+            text="Пресеты для удаления",
+            description="Их настройки апелляций тоже будут удалены из черновика.",
+            component=self.presets,
+        ))
+        self.add_save_hint()
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not await self.panel.check_access(interaction):
+            return
+        current = self.panel.draft.get_draft().get('arrest_durations', [])
+        selected = set(self.presets.values)
+        expected = {str(d['seconds']): d for d in self.snapshot}
+        actual = {str(d['seconds']): d for d in current}
+        if not selected or any(value not in expected or expected[value] != actual.get(value) for value in selected):
+            await interaction.response.send_message(
+                "❌ Пресеты изменились. Откройте форму заново.", ephemeral=True,
+            )
+            return
+        self.panel.draft.update('arrest_durations', [d for d in current if str(d['seconds']) not in selected])
+        appeals = self.panel.draft.get_draft().get('appeal_voting_durations', {})
+        self.panel.draft.update('appeal_voting_durations', {key: value for key, value in appeals.items() if key not in selected})
+        await self.finish(interaction, f"✅ Удалено пресетов: {len(selected)}.")
+
+
+class AppealDefaultsModal(SettingsModal):
+    def __init__(self, panel: MainConfigPanel):
+        super().__init__(panel, title="Сбросить время голосования")
+        self.confirm = Select(
+            placeholder="Выберите действие", required=True,
+            options=[discord.SelectOption(label="Установить значения по умолчанию", value="reset")],
+        )
+        self.add_item(ui.Label(
+            text="Все пресеты голосования",
+            description="До 30 сек — без апелляции. Для остальных — 1/10 срока, от 15 до 120 сек.",
+            component=self.confirm,
+        ))
+        self.add_save_hint()
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not await self.panel.check_access(interaction):
+            return
+        if self.confirm.values != ['reset']:
+            await interaction.response.send_message("❌ Выберите действие.", ephemeral=True)
+            return
+        durations = self.panel.draft.get_draft().get('arrest_durations', [])
+        if not durations:
+            await interaction.response.send_message("❌ Нет пресетов для настройки.", ephemeral=True)
+            return
+        self.panel.draft.update('appeal_voting_durations', {
+            str(d['seconds']): 0 if d['seconds'] <= 30 else max(15, min(120, d['seconds'] // 10))
+            for d in durations
+        })
+        await self.finish(interaction, "✅ Установлены значения по умолчанию.")
+
 
 class AddDurationModal(Modal, title="Добавить пресет времени ареста"):
     """Модальное окно для добавления пресета"""
